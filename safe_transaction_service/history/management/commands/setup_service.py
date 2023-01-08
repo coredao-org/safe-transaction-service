@@ -432,7 +432,7 @@ PROXY_FACTORIES: Dict[EthereumNetwork, List[Tuple[str, int]]] = {
         ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 930394),     # v1.3.0
     ],
     EthereumNetwork.CORE_CHAIN_MAINNET: [
-        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 50316, "1.3.0+L2"),  # v1.3.0
+        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 50316),  # v1.3.0
     ],
 }
 
