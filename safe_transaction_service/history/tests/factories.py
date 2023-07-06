@@ -18,6 +18,8 @@ from ..models import (
     EthereumBlock,
     EthereumTx,
     EthereumTxCallType,
+    IndexingStatus,
+    IndexingStatusType,
     InternalTx,
     InternalTxDecoded,
     InternalTxType,
@@ -33,6 +35,14 @@ from ..models import (
     TokenTransfer,
     WebHook,
 )
+
+
+class IndexingStatusFactory(DjangoModelFactory):
+    class Meta:
+        model = IndexingStatus
+
+    indexing_type = factory.fuzzy.FuzzyChoice([tag.value for tag in IndexingStatusType])
+    block_number = 0
 
 
 class EthereumBlockFactory(DjangoModelFactory):
@@ -115,7 +125,7 @@ class InternalTxFactory(DjangoModelFactory):
     refund_address = NULL_ADDRESS
     tx_type = InternalTxType.CALL.value
     call_type = EthereumTxCallType.CALL.value
-    trace_address = factory.Sequence(lambda n: str(n))
+    trace_address = factory.Sequence(str)
     error = None
 
 
@@ -266,7 +276,6 @@ class SafeContractFactory(DjangoModelFactory):
 
     address = factory.LazyFunction(lambda: Account.create().address)
     ethereum_tx = factory.SubFactory(EthereumTxFactory)
-    erc20_block_number = factory.LazyFunction(lambda: 0)
 
 
 class SafeContractDelegateFactory(DjangoModelFactory):

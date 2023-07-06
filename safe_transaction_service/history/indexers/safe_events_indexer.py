@@ -4,10 +4,10 @@ from typing import List, Optional
 
 from django.db import IntegrityError, transaction
 
-from eth_abi import decode_abi
+from eth_abi import decode as decode_abi
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
-from web3.contract import ContractEvent
+from web3.contract.contract import ContractEvent
 from web3.types import EventData
 
 from gnosis.eth import EthereumClient
@@ -31,10 +31,14 @@ logger = getLogger(__name__)
 class SafeEventsIndexerProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            from django.conf import settings
-
-            cls.instance = SafeEventsIndexer(EthereumClient(settings.ETHEREUM_NODE_URL))
+            cls.instance = cls.get_new_instance()
         return cls.instance
+
+    @classmethod
+    def get_new_instance(cls) -> "SafeEventsIndexer":
+        from django.conf import settings
+
+        return SafeEventsIndexer(EthereumClient(settings.ETHEREUM_NODE_URL))
 
     @classmethod
     def del_singleton(cls):
@@ -54,6 +58,8 @@ class SafeEventsIndexer(EventsIndexer):
     @cached_property
     def contract_events(self) -> List[ContractEvent]:
         """
+        Safe v1.3.0 L2 Events
+        ------------------
         event SafeMultiSigTransaction(
             address to,
             uint256 value,
@@ -98,7 +104,6 @@ class SafeEventsIndexer(EventsIndexer):
         event ExecutionFailure(
             bytes32 txHash, uint256 payment
         );
-
         event ExecutionSuccess(
             bytes32 txHash, uint256 payment
         );
@@ -112,7 +117,11 @@ class SafeEventsIndexer(EventsIndexer):
         event RemovedOwner(address owner);
         event ChangedThreshold(uint256 threshold);
 
-        event SafeReceived(address indexed sender, uint256 value);  // Incoming ether
+        # Incoming Ether
+        event SafeReceived(
+            address indexed sender,
+            uint256 value
+        );
 
         event ChangedFallbackHandler(address handler);
         event ChangedGuard(address guard);
@@ -120,7 +129,11 @@ class SafeEventsIndexer(EventsIndexer):
         # ProxyFactory
         event ProxyCreation(GnosisSafeProxy proxy, address singleton);
 
-        :return:
+        Safe v1.4.0 L2 Events
+        ------------------
+        TODO: Add them on on deployment
+
+        :return: List of supported `ContractEvent`
         """
         l2_contract = self.ethereum_client.w3.eth.contract(
             abi=gnosis_safe_l2_v1_3_0_abi
@@ -318,8 +331,8 @@ class SafeEventsIndexer(EventsIndexer):
             internal_tx_decoded = None
         elif event_name == "ChangedMasterCopy":
             internal_tx_decoded.function_name = "changeMasterCopy"
-            internal_tx.arguments = {
-                "_masterCopy": args.get("singleton") or args.get("masterCopy")
+            internal_tx_decoded.arguments = {
+                "_masterCopy": args.get("masterCopy") or args.get("singleton")
             }
         else:
             # 'SignMsg', 'ExecutionFailure', 'ExecutionSuccess',

@@ -1,23 +1,24 @@
-import operator
 from collections import OrderedDict
 from logging import getLogger
-from typing import Iterator, List, Sequence
+from typing import Iterator, List, Optional, Sequence
 
-import gevent
-from cache_memoize import cache_memoize
-from cachetools import cachedmethod
-from eth_abi.exceptions import DecodingError
+from django.db.models import QuerySet
+
 from eth_typing import ChecksumAddress
-from web3.contract import ContractEvent
-from web3.exceptions import BadFunctionCallOutput
+from web3.contract.contract import ContractEvent
 from web3.types import EventData, LogReceipt
 
 from gnosis.eth import EthereumClient
 
-from safe_transaction_service.tokens.models import Token
-from safe_transaction_service.utils.utils import chunks
-
-from ..models import ERC20Transfer, ERC721Transfer, SafeContract, TokenTransfer
+from ...utils.utils import FixedSizeDict
+from ..models import (
+    ERC20Transfer,
+    ERC721Transfer,
+    IndexingStatus,
+    MonitoredAddress,
+    SafeContract,
+    TokenTransfer,
+)
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
@@ -26,12 +27,14 @@ logger = getLogger(__name__)
 class Erc20EventsIndexerProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            from django.conf import settings
-
-            cls.instance = Erc20EventsIndexer(
-                EthereumClient(settings.ETHEREUM_NODE_URL)
-            )
+            cls.instance = cls.get_new_instance()
         return cls.instance
+
+    @classmethod
+    def get_new_instance(cls) -> "Erc20EventsIndexer":
+        from django.conf import settings
+
+        return Erc20EventsIndexer(EthereumClient(settings.ETHEREUM_NODE_URL))
 
     @classmethod
     def del_singleton(cls):
@@ -40,11 +43,21 @@ class Erc20EventsIndexerProvider:
 
 
 class Erc20EventsIndexer(EventsIndexer):
-    _cache_is_erc20 = {}
+    """
+    Indexes `ERC20` and `ERC721` `Transfer` events.
 
+    ERC20 Transfer Event: `Transfer(address indexed from, address indexed to, uint256 value)`
+    ERC721 Transfer Event: `Transfer(address indexed from, address indexed to, uint256 indexed tokenId)`
+
+    As `event topic` is the same both events can be indexed together, and then tell
+    apart based on the `indexed` part as `indexed` elements are stored in a different way in the
+    `ethereum tx receipt`.
     """
-    Indexes ERC20 and ERC721 `Transfer` Event (as ERC721 has the same topic)
-    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._processed_element_cache = FixedSizeDict(maxlen=40_000)  # Around 3MiB
 
     @property
     def contract_events(self) -> List[ContractEvent]:
@@ -75,56 +88,48 @@ class Erc20EventsIndexer(EventsIndexer):
         :param to_block_number:
         :return:
         """
-        if self.query_chunk_size:
-            addresses_chunks = chunks(addresses, self.query_chunk_size)
-        else:
-            addresses_chunks = [addresses]
 
-        jobs = [
-            gevent.spawn(
-                self.ethereum_client.erc20.get_total_transfer_history,
-                addresses_chunk,
+        # If not too much addresses it's alright to filter in the RPC server
+        parameter_addresses = (
+            None if len(addresses) > self.query_chunk_size else addresses
+        )
+
+        with self.auto_adjust_block_limit(from_block_number, to_block_number):
+            transfer_events = self.ethereum_client.erc20.get_total_transfer_history(
+                parameter_addresses,
                 from_block=from_block_number,
                 to_block=to_block_number,
             )
-            for addresses_chunk in addresses_chunks
+
+        if parameter_addresses:
+            return [
+                transfer_event
+                for transfer_event in transfer_events
+                if transfer_event["blockHash"]
+                != transfer_event["transactionHash"]  # CELO ERC20 indexing
+            ]
+
+        # Every ERC20/721 event is returned, we need to filter ourselves
+        addresses_set = set(addresses)
+        return [
+            transfer_event
+            for transfer_event in transfer_events
+            if transfer_event["blockHash"]
+            != transfer_event["transactionHash"]  # CELO ERC20 indexing
+            and (
+                transfer_event["args"]["to"] in addresses_set
+                or transfer_event["args"]["from"] in addresses_set
+            )
         ]
-        _ = gevent.joinall(jobs)
-        transfer_events = []
-        for job in jobs:
-            transfer_events.extend(job.get())
-        return transfer_events
 
-    @cachedmethod(cache=operator.attrgetter("_cache_is_erc20"))
-    @cache_memoize(60 * 60 * 24, prefix="erc20-events-indexer-is-erc20")  # 1 day
-    def _is_erc20(self, token_address: str) -> bool:
-        try:
-            token = Token.objects.get(address=token_address)
-            return token.is_erc20()
-        except Token.DoesNotExist:
-            try:
-                decimals = self.ethereum_client.erc20.get_decimals(token_address)
-                return decimals is not None
-            except (ValueError, BadFunctionCallOutput, DecodingError):
-                return False
-
-    def _process_decoded_element(self, event: EventData) -> EventData:
+    def _process_decoded_element(self, decoded_element: EventData) -> None:
         """
-        :param event: Be careful, it will be modified instead of copied
-        :return: The same event if it's a ERC20/ERC721. Tries to tell apart if it's not defined (`unknown` instead
-            of `value` or `tokenId`)
-        """
-        event_args = event["args"]
-        if "unknown" in event_args:  # Not standard event
-            event_args["value"] = event_args.pop("unknown")
+        Not used as `process_elements` is redefined using custom processors
 
-        if self._is_erc20(event["address"]):
-            if "tokenId" in event_args:
-                event_args["value"] = event_args.pop("tokenId")
-        else:
-            if "value" in event_args:
-                event_args["tokenId"] = event_args.pop("value")
-        return event
+        :param decoded_element:
+        :return:
+        """
+        pass
 
     def events_to_erc20_transfer(
         self, log_receipts: Sequence[EventData]
@@ -164,13 +169,79 @@ class Erc20EventsIndexer(EventsIndexer):
             logger.debug("End prefetching and storing of ethereum txs")
 
             logger.debug("Storing TokenTransfer objects")
+            not_processed_log_receipts = [
+                log_receipt
+                for log_receipt in log_receipts
+                if not self.element_already_processed_checker.is_processed(
+                    log_receipt["transactionHash"],
+                    log_receipt["blockHash"],
+                    log_receipt["logIndex"],
+                )
+            ]
             result_erc20 = ERC20Transfer.objects.bulk_create_from_generator(
-                self.events_to_erc20_transfer(log_receipts), ignore_conflicts=True
+                self.events_to_erc20_transfer(not_processed_log_receipts),
+                ignore_conflicts=True,
             )
             result_erc721 = ERC721Transfer.objects.bulk_create_from_generator(
-                self.events_to_erc721_transfer(log_receipts), ignore_conflicts=True
+                self.events_to_erc721_transfer(not_processed_log_receipts),
+                ignore_conflicts=True,
             )
             logger.debug("Stored TokenTransfer objects")
+            logger.debug("Marking events as processed")
+            for log_receipt in not_processed_log_receipts:
+                self.element_already_processed_checker.mark_as_processed(
+                    log_receipt["transactionHash"],
+                    log_receipt["blockHash"],
+                    log_receipt["logIndex"],
+                )
+            logger.debug("Marked events as processed")
             return range(
                 result_erc20 + result_erc721
             )  # TODO Hack to prevent returning `TokenTransfer` and using too much RAM
+
+    def get_almost_updated_addresses(
+        self, current_block_number: int
+    ) -> QuerySet[MonitoredAddress]:
+        """
+
+        :param current_block_number:
+        :return: Monitored addresses to be processed
+        """
+
+        logger.debug("%s: Retrieving monitored addresses", self.__class__.__name__)
+
+        addresses = self.database_queryset.all()
+
+        logger.debug("%s: Retrieved monitored addresses", self.__class__.__name__)
+        return addresses
+
+    def get_not_updated_addresses(
+        self, current_block_number: int
+    ) -> QuerySet[MonitoredAddress]:
+        """
+        :param current_block_number:
+        :return: Monitored addresses to be processed
+        """
+        return []
+
+    def get_minimum_block_number(
+        self, addresses: Optional[Sequence[str]] = None
+    ) -> Optional[int]:
+        return IndexingStatus.objects.get_erc20_721_indexing_status().block_number
+
+    def update_monitored_addresses(
+        self, addresses: Sequence[str], from_block_number: int, to_block_number: int
+    ) -> bool:
+        # Keep indexing going on the next block
+        new_to_block_number = to_block_number + 1
+        updated = IndexingStatus.objects.set_erc20_721_indexing_status(
+            new_to_block_number, from_block_number=from_block_number
+        )
+        if not updated:
+            logger.warning(
+                "%s: Possible reorg - Cannot update erc20_721 indexing status from-block-number=%d to-block-number=%d",
+                self.__class__.__name__,
+                from_block_number,
+                to_block_number,
+            )
+        return updated

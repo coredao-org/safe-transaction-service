@@ -12,7 +12,7 @@ from django_celery_beat.models import PeriodicTask
 from gnosis.eth.ethereum_client import EthereumClient, EthereumNetwork
 
 from ..indexers import Erc20EventsIndexer, InternalTxIndexer, SafeEventsIndexer
-from ..models import ProxyFactory, SafeMasterCopy
+from ..models import IndexingStatus, ProxyFactory, SafeMasterCopy
 from ..services import IndexServiceProvider
 from ..tasks import logger as task_logger
 from .factories import (
@@ -323,7 +323,17 @@ class TestCommands(TestCase):
         IndexServiceProvider.del_singleton()
 
     def test_setup_service_mainnet(self):
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
         self._test_setup_service(EthereumNetwork.MAINNET)
+        first_safe_block_deployed = (
+            6569433  # 0.0.2 deployment block, first Safe contract
+        )
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number,
+            first_safe_block_deployed,
+        )
 
         # Check last master copy was created
         last_master_copy_address = "0x6851D6fDFAfD08c0295C392436245E5bc78B0185"
@@ -349,9 +359,27 @@ class TestCommands(TestCase):
             last_proxy_factory.tx_block_number, last_proxy_factory_initial_block
         )
 
-        self.assertEqual(SafeMasterCopy.objects.count(), 8)
-        self.assertEqual(SafeMasterCopy.objects.l2().count(), 1)
-        self.assertEqual(ProxyFactory.objects.count(), 4)
+        # At May 2023 we support 9 Master Copies, 2 L2 Master Copies and 5 Proxy Factories
+        self.assertEqual(SafeMasterCopy.objects.count(), 9)
+        self.assertEqual(SafeMasterCopy.objects.l2().count(), 2)
+        self.assertEqual(ProxyFactory.objects.count(), 5)
+
+    def test_setup_service_mainnet_erc20_indexing_setup(self):
+        # Test IndexingStatus ERC20 is not modified if higher than the oldest master copy
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
+        first_safe_block_deployed = (
+            6569433  # 0.0.2 deployment block, first Safe contract
+        )
+        IndexingStatus.objects.set_erc20_721_indexing_status(
+            first_safe_block_deployed + 20
+        )
+        self._test_setup_service(EthereumNetwork.MAINNET)
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number,
+            first_safe_block_deployed + 20,
+        )
 
     def test_setup_service_rinkeby(self):
         self._test_setup_service(EthereumNetwork.RINKEBY)
@@ -385,7 +413,33 @@ class TestCommands(TestCase):
             MultisigTransactionFactory(
                 origin="another-something", ethereum_tx=None
             )  # Will not be exported
-            MultisigTransactionFactory(origin=None)  # Will not be exported
+            MultisigTransactionFactory(origin={})  # Will not be exported
             buf = StringIO()
             call_command(command, arguments, stdout=buf)
             self.assertIn("Start exporting of 1", buf.getvalue())
+
+    @mock.patch(
+        "safe_transaction_service.history.management.commands.check_chainid_matches.get_chain_id"
+    )
+    def test_check_chainid_matches(self, get_chain_id_mock: MagicMock):
+        command = "check_chainid_matches"
+
+        # Create ChainId model
+        get_chain_id_mock.return_value = EthereumNetwork.MAINNET.value
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("EthereumRPC chainId 1 looks good", buf.getvalue())
+
+        # Use different chainId
+        get_chain_id_mock.return_value = EthereumNetwork.GNOSIS.value
+        with self.assertRaisesMessage(
+            CommandError,
+            "EthereumRPC chainId 100 does not match previously used chainId 1",
+        ):
+            call_command(command)
+
+        # Check again with the initial chainId
+        get_chain_id_mock.return_value = EthereumNetwork.MAINNET.value
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("EthereumRPC chainId 1 looks good", buf.getvalue())

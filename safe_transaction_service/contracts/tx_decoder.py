@@ -18,6 +18,7 @@ from typing import (
 
 import gevent
 from cachetools import TTLCache, cachedmethod
+from eth_abi import decode as decode_abi
 from eth_abi.exceptions import DecodingError
 from eth_typing import ChecksumAddress, HexStr
 from eth_utils import function_abi_to_4byte_selector
@@ -199,7 +200,7 @@ class SafeTxDecoder:
         try:
             names = get_abi_input_names(fn_abi)
             types = get_abi_input_types(fn_abi)
-            decoded = self.dummy_w3.codec.decode_abi(types, cast(HexBytes, params))
+            decoded = decode_abi(types, cast(HexBytes, params))
             normalized = map_abi_data(BASE_RETURN_NORMALIZERS, types, decoded)
             values = map(self._parse_decoded_arguments, normalized)
         except (ValueError, DecodingError) as exc:
@@ -538,8 +539,10 @@ class DbTxDecoder(TxDecoder):
         :param address: Contract address
         :return: Dictionary of function selects with ABIFunction if found, `None` otherwise
         """
-        abis = ContractAbi.objects.filter(contracts__address=address).values_list(
-            "abi", flat=True
+        abis = (
+            ContractAbi.objects.filter(contracts__address=address)
+            .order_by("relevance")
+            .values_list("abi", flat=True)
         )
         if abis:
             return self._generate_selectors_with_abis_from_abi(abis[0])
@@ -563,7 +566,7 @@ class DbTxDecoder(TxDecoder):
                     and selector in contract_selectors_with_abis
                 ):
                     # If the selector is available in the abi specific for the address we will use that one
-                    # Otherwise we fallback to the general abi that matches the selector
+                    # Otherwise we fall back to the general abi that matches the selector
                     return contract_selectors_with_abis[selector]
             return self.fn_selectors_with_abis[selector]
 

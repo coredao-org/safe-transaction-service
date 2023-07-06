@@ -8,6 +8,7 @@ import factory
 
 from gnosis.eth import EthereumNetwork
 
+from safe_transaction_service.events.tasks import send_event_to_queue_task
 from safe_transaction_service.notifications.tasks import send_notification_task
 
 from ..models import (
@@ -77,27 +78,33 @@ class TestSignals(TestCase):
         self.assertEqual(payload["chainId"], str(EthereumNetwork.GANACHE.value))
 
     @factory.django.mute_signals(post_save)
-    def test_process_webhook(self):
+    @mock.patch.object(send_webhook_task, "apply_async")
+    @mock.patch.object(send_notification_task, "apply_async")
+    @mock.patch.object(send_event_to_queue_task, "delay")
+    def test_process_webhook(
+        self,
+        webhook_task_mock,
+        send_notification_task_mock,
+        send_event_to_queue_task_mock,
+    ):
         multisig_confirmation = MultisigConfirmationFactory()
-        with mock.patch.object(send_webhook_task, "apply_async") as webhook_task_mock:
-            with mock.patch.object(
-                send_notification_task, "apply_async"
-            ) as send_notification_task_mock:
-                process_webhook(MultisigConfirmation, multisig_confirmation, True)
-                webhook_task_mock.assert_called()
-                send_notification_task_mock.assert_called()
+        process_webhook(MultisigConfirmation, multisig_confirmation, True)
+        webhook_task_mock.assert_called()
+        send_notification_task_mock.assert_called()
+        send_event_to_queue_task_mock.assert_called()
+        # reset calls
+        webhook_task_mock.reset_mock()
+        send_notification_task_mock.reset_mock()
+        send_event_to_queue_task_mock.reset_mock()
 
         multisig_confirmation.created -= timedelta(minutes=75)
-        with mock.patch.object(send_webhook_task, "apply_async") as webhook_task_mock:
-            with mock.patch.object(
-                send_notification_task, "apply_async"
-            ) as send_notification_task_mock:
-                process_webhook(MultisigConfirmation, multisig_confirmation, True)
-                webhook_task_mock.assert_not_called()
-                send_notification_task_mock.assert_not_called()
+        process_webhook(MultisigConfirmation, multisig_confirmation, True)
+        webhook_task_mock.assert_not_called()
+        send_notification_task_mock.assert_not_called()
+        send_event_to_queue_task_mock.assert_not_called()
 
     @factory.django.mute_signals(post_save)
-    def test_is_relevant_notification(self):
+    def test_is_relevant_notification_multisig_confirmation(self):
         multisig_confirmation = MultisigConfirmationFactory()
         self.assertFalse(
             is_relevant_notification(
@@ -116,10 +123,18 @@ class TestSignals(TestCase):
             )
         )
 
-        multisig_tx = MultisigTransactionFactory()
+    @factory.django.mute_signals(post_save)
+    def test_is_relevant_notification_multisig_transaction(self):
+        multisig_tx = MultisigTransactionFactory(trusted=False)
+        self.assertFalse(
+            is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
+        )
+
+        multisig_tx.trusted = True
         self.assertTrue(
             is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)
         )
+
         multisig_tx.created -= timedelta(minutes=75)
         self.assertTrue(
             is_relevant_notification(multisig_tx.__class__, multisig_tx, created=False)

@@ -1,7 +1,8 @@
+import json
 import logging
 from dataclasses import asdict
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -9,6 +10,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from eth_account import Account
+from factory.fuzzy import FuzzyText
 from hexbytes import HexBytes
 from requests import ReadTimeout
 from rest_framework import status
@@ -16,7 +18,7 @@ from rest_framework.test import APIRequestFactory, APITestCase, force_authentica
 from web3 import Web3
 
 from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.ethereum_client import ParityManager
+from gnosis.eth.ethereum_client import EthereumClient, TracingManager
 from gnosis.eth.utils import fast_is_checksum_address
 from gnosis.safe import CannotEstimateGas, Safe, SafeOperation
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
@@ -32,15 +34,15 @@ from safe_transaction_service.tokens.tests.factories import TokenFactory
 
 from ..helpers import DelegateSignatureHelper
 from ..models import (
+    IndexingStatus,
     MultisigConfirmation,
     MultisigTransaction,
     SafeContractDelegate,
     SafeMasterCopy,
 )
 from ..serializers import TransferType
-from ..services import BalanceService, CollectiblesService
+from ..services import BalanceService
 from ..services.balance_service import Erc20InfoWithLogo
-from ..services.collectibles_service import CollectibleWithMetadata
 from ..views import SafeMultisigTransactionListView
 from .factories import (
     ERC20TransferFactory,
@@ -67,6 +69,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.get(url, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_swagger_json_schema(self):
+        url = reverse("schema-json", args=(".json",))
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_swagger_ui(self):
+        url = reverse("schema-swagger-ui")
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     def test_about_ethereum_rpc_url(self):
         for url_name in (
             "v1:history:about-ethereum-rpc",
@@ -81,6 +93,96 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 self.assertEqual(response.data["chain_id"], 1337)
                 self.assertEqual(response.data["chain"], "GANACHE")
                 self.assertEqual(response.data["syncing"], False)
+
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2_000,
+    )
+    def test_indexing_view(self, current_block_number_mock: PropertyMock):
+        IndexingStatus.objects.set_erc20_721_indexing_status(2_005)
+        url = reverse("v1:history:indexing")
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2_000)
+        self.assertEqual(response.data["erc20_block_number"], 2_000)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 2_000)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], True)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(500)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 2000)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], False)
+
+        safe_master_copy = SafeMasterCopyFactory(tx_block_number=2000)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 1999)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], False)
+
+        safe_master_copy.tx_block_number = 600
+        safe_master_copy.save(update_fields=["tx_block_number"])
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 499)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 599)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(10)
+        SafeMasterCopyFactory(tx_block_number=8)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 9)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 7)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        SafeMasterCopyFactory(tx_block_number=11)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 9)
+        self.assertEqual(response.data["erc20_synced"], False)
+        self.assertEqual(response.data["master_copies_block_number"], 7)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
+
+        IndexingStatus.objects.set_erc20_721_indexing_status(2_000)
+        SafeMasterCopy.objects.update(tx_block_number=2_000)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 1999)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 1999)
+        self.assertEqual(response.data["master_copies_synced"], True)
+        self.assertEqual(response.data["synced"], True)
+
+        SafeMasterCopyFactory(tx_block_number=48)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["current_block_number"], 2000)
+        self.assertEqual(response.data["erc20_block_number"], 1999)
+        self.assertEqual(response.data["erc20_synced"], True)
+        self.assertEqual(response.data["master_copies_block_number"], 47)
+        self.assertEqual(response.data["master_copies_synced"], False)
+        self.assertEqual(response.data["synced"], False)
 
     def test_all_transactions_view(self):
         safe_address = Account.create().address
@@ -302,6 +404,33 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["results"][0]["transfers"][0]["token_id"])
         self.assertEqual(response.data["results"][0]["transfers"][0]["value"], "0")
 
+    def test_all_transactions_duplicated_module_view(self):
+        """
+        Test 2 module transactions with the same tx_hash
+        """
+        safe_address = Account.create().address
+        module_transaction_1 = ModuleTransactionFactory(safe=safe_address)
+        module_transaction_2 = ModuleTransactionFactory(
+            safe=safe_address,
+            internal_tx__ethereum_tx=module_transaction_1.internal_tx.ethereum_tx,
+        )
+
+        self.assertEqual(
+            module_transaction_1.internal_tx.ethereum_tx,
+            module_transaction_2.internal_tx.ethereum_tx,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:all-transactions", args=(safe_address,))
+            + "?queued=False&trusted=True"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), response.data["count"], 2)
+        self.assertEqual(
+            {module_transaction_1.module, module_transaction_2.module},
+            {module_tx["module"] for module_tx in response.data["results"]},
+        )
+
     def test_get_module_transactions(self):
         safe_address = Account.create().address
         response = self.client.get(
@@ -351,6 +480,63 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.get(url, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 1)
+
+    def test_get_module_transaction(self):
+        wrong_module_transaction_id = "wrong_module_transaction_id"
+        url = reverse(
+            "v1:history:module-transaction", args=(wrong_module_transaction_id,)
+        )
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        no_exist_module_transaction_id = (
+            "ief060441f0101ab83d62066b962f97e3a582686e0720157407c965c5946c2f7a0"
+        )
+        url = reverse(
+            "v1:history:module-transaction", args=(no_exist_module_transaction_id,)
+        )
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        safe_address = Account.create().address
+        ethereum_tx_hash = (
+            "0xef060441f0101ab83d62066b962f97e3a582686e0720157407c965c5946c2f7a"
+        )
+        ethereum_tx = EthereumTxFactory(tx_hash=ethereum_tx_hash)
+        internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx, trace_address="0,0,0,0"
+        )
+        module_transaction = ModuleTransactionFactory(
+            internal_tx=internal_tx, safe=safe_address
+        )
+        module_transaction_id = (
+            "ief060441f0101ab83d62066b962f97e3a582686e0720157407c965c5946c2f7a0,0,0,0"
+        )
+        url = reverse("v1:history:module-transaction", args=(module_transaction_id,))
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "created": module_transaction.created.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "executionDate": module_transaction.internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "blockNumber": module_transaction.internal_tx.ethereum_tx.block_id,
+                "isSuccessful": not module_transaction.failed,
+                "transactionHash": module_transaction.internal_tx.ethereum_tx_id,
+                "safe": safe_address,
+                "module": module_transaction.module,
+                "to": module_transaction.to,
+                "value": str(module_transaction.value),
+                "data": module_transaction.data.hex(),
+                "operation": module_transaction.operation,
+                "dataDecoded": None,
+                "moduleTransactionId": module_transaction_id,
+            },
+        )
 
     def test_get_multisig_confirmation(self):
         random_safe_tx_hash = Web3.keccak(text="enxebre").hex()
@@ -534,6 +720,28 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(
             response.json()["transactionHash"], multisig_tx.ethereum_tx.tx_hash
         )
+        # Test empty origin object
+        multisig_tx.origin = {}
+        multisig_tx.save(update_fields=["origin"])
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["origin"], json.dumps({}))
+        self.assertEqual(json.loads(response.data["origin"]), {})
+
+        # Test origin object
+        origin = {"app": "Testing App", "name": "Testing"}
+        multisig_tx.origin = origin
+        multisig_tx.save(update_fields=["origin"])
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["origin"], json.dumps(origin))
+        self.assertEqual(json.loads(response.data["origin"]), origin)
 
     def test_get_multisig_transactions(self):
         safe_address = Account.create().address
@@ -1142,6 +1350,31 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_tx_hash=safe_tx.safe_tx_hash
         )
         self.assertEqual(multisig_tx_db.origin, data["origin"])
+        data["origin"] = '{"url": "test", "name":"test"}'
+        data["nonce"] = 1
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        response = self.client.post(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        multisig_tx_db = MultisigTransaction.objects.get(
+            safe_tx_hash=safe_tx.safe_tx_hash
+        )
+        self.assertEqual(multisig_tx_db.origin, json.loads(data["origin"]))
 
     def test_post_multisig_transactions_with_multiple_signatures(self):
         safe_owners = [Account.create() for _ in range(4)]
@@ -1475,288 +1708,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             ],
         )
 
-    # Test without pagination
-    def test_safe_collectibles(self):
-        safe_address = Account.create().address
-        response = self.client.get(
-            reverse("v1:history:safe-collectibles", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-        SafeContractFactory(address=safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-collectibles", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 0)
-
-        with mock.patch.object(
-            CollectiblesService, "get_collectibles_with_metadata", autospec=True
-        ) as function:
-            token_name = "TokenName"
-            token_symbol = "SYMBOL"
-            token_address = Account.create().address
-            logo_uri = f"http://token.org/{token_address}.png"
-            token_id = 54
-            token_uri = f"http://token.org/token-id/{token_id}"
-            image = "http://token.org/token-id/1/image"
-            name = "Test token name"
-            description = "Test token description"
-            function.return_value = [
-                CollectibleWithMetadata(
-                    token_name,
-                    token_symbol,
-                    logo_uri,
-                    token_address,
-                    token_id,
-                    token_uri,
-                    {"image": image, "name": name, "description": description},
-                )
-            ]
-            response = self.client.get(
-                reverse("v1:history:safe-collectibles", args=(safe_address,)),
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(
-                response.data,
-                [
-                    {
-                        "address": token_address,
-                        "token_name": token_name,
-                        "token_symbol": token_symbol,
-                        "logo_uri": logo_uri,
-                        "id": str(token_id),
-                        "uri": token_uri,
-                        "name": name,
-                        "description": description,
-                        "image_uri": image,
-                        "metadata": {
-                            "image": image,
-                            "name": name,
-                            "description": description,
-                        },
-                    }
-                ],
-            )
-
-    def test_get_safe_delegate_list(self):
-        safe_address = Account.create().address
-        response = self.client.get(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 0)
-
-        safe_contract_delegate = SafeContractDelegateFactory()
-        safe_address = safe_contract_delegate.safe_contract_id
-        response = self.client.get(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        self.assertEqual(response.data["count"], 1)
-        result = response.data["results"][0]
-        self.assertEqual(result["delegate"], safe_contract_delegate.delegate)
-        self.assertEqual(result["delegator"], safe_contract_delegate.delegator)
-        self.assertEqual(result["label"], safe_contract_delegate.label)
-
-        safe_contract_delegate = SafeContractDelegateFactory(
-            safe_contract=safe_contract_delegate.safe_contract
-        )
-        response = self.client.get(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 2)
-
-        # A different non related Safe should not increase the number
-        SafeContractDelegateFactory()
-        response = self.client.get(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 2)
-
-    def test_delete_safe_delegate_list(self):
-        endpoint = "v1:history:safe-delegates"
-
-        owner_account = Account.create()
-        safe_address = self.deploy_test_safe(owners=[owner_account.address]).address
-        safe_contract = SafeContractFactory(address=safe_address)
-        response = self.client.delete(
-            reverse(endpoint, args=(safe_address,)), format="json"
-        )
-        self.assertEqual(
-            response.status_code, status.HTTP_400_BAD_REQUEST
-        )  # Data is missing
-
-        data = {
-            "signature": "0x" + "1" * 130,
-        }
-        not_existing_safe = Account.create().address
-        response = self.client.delete(
-            reverse(endpoint, args=(not_existing_safe,)), format="json", data=data
-        )
-        self.assertIn(
-            f"Safe={not_existing_safe} does not exist",
-            response.data["non_field_errors"][0],
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        hash_to_sign = DelegateSignatureHelper.calculate_hash(
-            safe_address, eth_sign=True
-        )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
-        SafeContractDelegateFactory(safe_contract=safe_contract)
-        SafeContractDelegateFactory(safe_contract=safe_contract)
-        SafeContractDelegateFactory(safe_contract=SafeContractFactory())
-        self.assertEqual(SafeContractDelegate.objects.count(), 3)
-        response = self.client.delete(
-            reverse(endpoint, args=(safe_address,)), format="json", data=data
-        )
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertEqual(SafeContractDelegate.objects.count(), 1)
-
-        # Sign random address instead of the Safe address
-        hash_to_sign = DelegateSignatureHelper.calculate_hash(
-            Account.create().address, eth_sign=True
-        )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
-        response = self.client.delete(
-            reverse(endpoint, args=(safe_address,)), format="json", data=data
-        )
-        self.assertIn(
-            "Signing owner is not an owner of the Safe",
-            response.data["non_field_errors"][0],
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_post_safe_delegate(self):
-        safe_address = Account.create().address
-        delegate_address = Account.create().address
-        label = "Saul Goodman"
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(
-            response.status_code, status.HTTP_400_BAD_REQUEST
-        )  # Data is missing
-
-        data = {
-            "delegate": delegate_address,
-            "label": label,
-            "signature": "0x" + "1" * 130,
-        }
-
-        owner_account = Account.create()
-        safe_address = self.deploy_test_safe(owners=[owner_account.address]).address
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertIn(
-            f"Safe={safe_address} does not exist", response.data["non_field_errors"][0]
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        safe_contract = SafeContractFactory(address=safe_address)
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertIn(
-            "Signing owner is not an owner of the Safe",
-            response.data["non_field_errors"][0],
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        self.assertEqual(SafeContractDelegate.objects.count(), 0)
-        hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_address)
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(SafeContractDelegate.objects.count(), 1)
-        safe_contract_delegate = SafeContractDelegate.objects.first()
-        self.assertEqual(safe_contract_delegate.delegate, delegate_address)
-        self.assertEqual(safe_contract_delegate.delegator, owner_account.address)
-        self.assertEqual(safe_contract_delegate.label, label)
-
-        label = "Jimmy McGill"
-        data["label"] = label
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(SafeContractDelegate.objects.count(), 1)
-        safe_contract_delegate.refresh_from_db()
-        self.assertEqual(safe_contract_delegate.label, label)
-
-        another_label = "Kim Wexler"
-        another_delegate_address = Account.create().address
-        data = {
-            "delegate": another_delegate_address,
-            "label": another_label,
-            "signature": owner_account.signHash(
-                DelegateSignatureHelper.calculate_hash(
-                    another_delegate_address, eth_sign=True
-                )
-            )["signature"].hex(),
-        }
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        # Test not internal server error on contract signature
-        signature = signature_to_bytes(
-            0, int(owner_account.address, 16), 65
-        ) + HexBytes("0" * 65)
-        data["signature"] = signature.hex()
-        response = self.client.post(
-            reverse("v1:history:safe-delegates", args=(safe_address,)),
-            format="json",
-            data=data,
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-        response = self.client.get(
-            reverse("v1:history:safe-delegates", args=(safe_address,)), format="json"
-        )
-        self.assertCountEqual(
-            response.data["results"],
-            [
-                {
-                    "delegate": delegate_address,
-                    "delegator": owner_account.address,
-                    "label": label,
-                    "safe": safe_address,
-                },
-                {
-                    "delegate": another_delegate_address,
-                    "delegator": owner_account.address,
-                    "label": another_label,
-                    "safe": safe_address,
-                },
-            ],
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(SafeContractDelegate.objects.count(), 2)
-        self.assertCountEqual(
-            SafeContractDelegate.objects.get_delegates_for_safe(safe_address),
-            [delegate_address, another_delegate_address],
-        )
-
     def test_delegates_post(self):
         url = reverse("v1:history:delegates")
         safe_address = Account.create().address
@@ -1830,7 +1781,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "label": another_label,
             "delegate": delegate.address,
             "delegator": delegator.address,
-            "safe": None,
             "signature": delegator.signHash(
                 DelegateSignatureHelper.calculate_hash(delegate.address, eth_sign=True)
             )["signature"].hex(),
@@ -1989,10 +1939,25 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )  # Data is missing
 
         data = {
-            # 'delegate': delegate_address,
-            "signature": "0x"
-            + "1" * 130,
+            "delegate": Account.create().address,
+            "signature": "0x" + "1" * 130,
         }
+        response = self.client.delete(
+            reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(
+            {
+                "code": 2,
+                "message": "Delegate address in body should match the one in the url",
+                "arguments": [data["delegate"], delegate_address],
+            },
+            response.data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+        del data["delegate"]
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
@@ -2108,7 +2073,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         value = 2
         InternalTxFactory(to=safe_address, value=0)
-        internal_tx = InternalTxFactory(to=safe_address, value=value)
+        ethereum_tx_hash = (
+            "0x5a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        ethereum_tx = EthereumTxFactory(tx_hash=ethereum_tx_hash)
+        internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx, trace_address="0,1", to=safe_address, value=value
+        )
+        internal_tx_transfer_id = (
+            "i5a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d590,1"
+        )
         InternalTxFactory(to=Account.create().address, value=value)
         response = self.client.get(
             reverse("v1:history:incoming-transfers", args=(safe_address,)),
@@ -2148,7 +2122,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         token_value = 6
-        ethereum_erc_20_event = ERC20TransferFactory(to=safe_address, value=token_value)
+        erc20_tx_hash = (
+            "0x7a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc20_tx = EthereumTxFactory(tx_hash=erc20_tx_hash)
+        ethereum_erc_20_event = ERC20TransferFactory(
+            ethereum_tx=erc20_tx, to=safe_address, value=token_value, log_index=12
+        )
+        erc20_transfer_id = (
+            "e7a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d5912"
+        )
         token = TokenFactory(address=ethereum_erc_20_event.address)
         response = self.client.get(
             reverse("v1:history:incoming-transfers", args=(safe_address,)),
@@ -2164,6 +2147,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
                         "+00:00", "Z"
                     ),
+                    "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
                     "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
                     "to": safe_address,
@@ -2185,6 +2169,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
                         "+00:00", "Z"
                     ),
+                    "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
                     "blockNumber": internal_tx.ethereum_tx.block_id,
                     "to": safe_address,
@@ -2198,8 +2183,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
         token_id = 17
+        erc721_tx_hash = (
+            "0x6a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc721_tx = EthereumTxFactory(tx_hash=erc721_tx_hash)
         ethereum_erc_721_event = ERC721TransferFactory(
-            to=safe_address, token_id=token_id
+            ethereum_tx=erc721_tx, to=safe_address, token_id=token_id, log_index=123
+        )
+        erc721_transfer_id = (
+            "e6a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59123"
         )
         response = self.client.get(
             reverse("v1:history:incoming-transfers", args=(safe_address,)),
@@ -2215,6 +2207,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
                         "+00:00", "Z"
                     ),
+                    "transferId": erc721_transfer_id,
                     "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
                     "blockNumber": ethereum_erc_721_event.ethereum_tx.block_id,
                     "to": safe_address,
@@ -2229,6 +2222,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
                         "+00:00", "Z"
                     ),
+                    "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
                     "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
                     "to": safe_address,
@@ -2250,6 +2244,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
                         "+00:00", "Z"
                     ),
+                    "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
                     "blockNumber": internal_tx.ethereum_tx.block_id,
                     "to": safe_address,
@@ -2273,7 +2268,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         value = 2
         InternalTxFactory(to=safe_address, value=0)
-        internal_tx = InternalTxFactory(to=safe_address, value=value)
+        ethereum_tx_hash = (
+            "0x5a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        ethereum_tx = EthereumTxFactory(tx_hash=ethereum_tx_hash)
+        internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx, trace_address="0,1,1", to=safe_address, value=value
+        )
+        internal_tx_transfer_id = (
+            "i5a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d590,1,1"
+        )
         InternalTxFactory(to=Account.create().address, value=value)
         response = self.client.get(
             reverse("v1:history:transfers", args=(safe_address,)), format="json"
@@ -2318,7 +2322,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         # Add from tx
-        internal_tx_2 = InternalTxFactory(_from=safe_address, value=value)
+        ethereum_tx_hash_2 = (
+            "0x5f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        ethereum_tx_2 = EthereumTxFactory(tx_hash=ethereum_tx_hash_2)
+        internal_tx_2 = InternalTxFactory(
+            ethereum_tx=ethereum_tx_2, _from=safe_address, value=value, trace_address=""
+        )
+        internal_tx_2_transfer_id = (
+            "i5f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
         response = self.client.get(
             reverse("v1:history:transfers", args=(safe_address,)), format="json"
         )
@@ -2328,9 +2341,28 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["results"][1]["value"], str(value))
 
         token_value = 6
-        ethereum_erc_20_event = ERC20TransferFactory(to=safe_address, value=token_value)
+        erc20_tx_hash = (
+            "0x7a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc20_tx = EthereumTxFactory(tx_hash=erc20_tx_hash)
+        ethereum_erc_20_event = ERC20TransferFactory(
+            ethereum_tx=erc20_tx, to=safe_address, value=token_value, log_index=12
+        )
+        erc20_transfer_id = (
+            "e7a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d5912"
+        )
+        erc20_tx_hash_2 = (
+            "0x8a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc20_tx_2 = EthereumTxFactory(tx_hash=erc20_tx_hash_2)
         ethereum_erc_20_event_2 = ERC20TransferFactory(
-            _from=safe_address, value=token_value
+            ethereum_tx=erc20_tx_2,
+            _from=safe_address,
+            value=token_value,
+            log_index=1299,
+        )
+        erc20_transfer_id_2 = (
+            "e8a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d591299"
         )
         token = TokenFactory(address=ethereum_erc_20_event.address)
         response = self.client.get(
@@ -2345,6 +2377,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "blockNumber": ethereum_erc_20_event_2.ethereum_tx.block_id,
+                "transferId": erc20_transfer_id_2,
                 "transactionHash": ethereum_erc_20_event_2.ethereum_tx_id,
                 "to": ethereum_erc_20_event_2.to,
                 "value": str(token_value),
@@ -2359,6 +2392,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
+                "transferId": erc20_transfer_id,
                 "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
                 "to": safe_address,
                 "value": str(token_value),
@@ -2380,6 +2414,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "blockNumber": internal_tx_2.ethereum_tx.block_id,
+                "transferId": internal_tx_2_transfer_id,
                 "transactionHash": internal_tx_2.ethereum_tx_id,
                 "to": internal_tx_2.to,
                 "value": str(value),
@@ -2394,6 +2429,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "blockNumber": internal_tx.ethereum_tx.block_id,
+                "transferId": internal_tx_transfer_id,
                 "transactionHash": internal_tx.ethereum_tx_id,
                 "to": safe_address,
                 "value": str(value),
@@ -2406,11 +2442,25 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.json()["results"], expected_results)
 
         token_id = 17
-        ethereum_erc_721_event = ERC721TransferFactory(
-            to=safe_address, token_id=token_id
+        erc721_tx_hash = (
+            "0x1f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
         )
+        erc721_tx = EthereumTxFactory(tx_hash=erc721_tx_hash)
+        ethereum_erc_721_event = ERC721TransferFactory(
+            ethereum_tx=erc721_tx, to=safe_address, token_id=token_id, log_index=0
+        )
+        erc721_transfer_id = (
+            "e1f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d590"
+        )
+        erc721_tx_hash_2 = (
+            "0x2f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc721_tx_2 = EthereumTxFactory(tx_hash=erc721_tx_hash_2)
         ethereum_erc_721_event_2 = ERC721TransferFactory(
-            _from=safe_address, token_id=token_id
+            ethereum_tx=erc721_tx_2, _from=safe_address, token_id=token_id, log_index=2
+        )
+        erc721_transfer_id_2 = (
+            "e2f6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d592"
         )
         response = self.client.get(
             reverse("v1:history:transfers", args=(safe_address,)), format="json"
@@ -2424,6 +2474,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "transactionHash": ethereum_erc_721_event_2.ethereum_tx_id,
+                "transferId": erc721_transfer_id_2,
                 "blockNumber": ethereum_erc_721_event_2.ethereum_tx.block_id,
                 "to": ethereum_erc_721_event_2.to,
                 "value": None,
@@ -2438,6 +2489,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     "+00:00", "Z"
                 ),
                 "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
+                "transferId": erc721_transfer_id,
                 "blockNumber": ethereum_erc_721_event.ethereum_tx.block_id,
                 "to": safe_address,
                 "value": None,
@@ -2498,6 +2550,164 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         for result in response.data["results"]:
             self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
+    def test_get_transfer_view(self):
+        # test wrong random transfer_id
+        transfer_id = FuzzyText(length=6).fuzz()
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # test internal_tx transfer_id empty trace_address
+        transfer_id = (
+            "ief060441f0101ab83d62066b962f97e3a582686e0720157407c965c5946c2f7a"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # test invalid erc20 transfer_id empty log_index
+        transfer_id = (
+            "e27e15ba8dea473d98c80a6b45d372c0f3c6f8c184177044c935c37eb419d7216"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # test invalid erc20 transfer id wrong log index
+        transfer_id = (
+            "e27e15ba8dea473d98c80a6b45d372c0f3c6f8c184177044c935c37eb419d72161,1"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        safe_address = Account.create().address
+        ethereum_tx_hash = (
+            "0x4f6754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        ethereum_tx = EthereumTxFactory(tx_hash=ethereum_tx_hash)
+        internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx, to=safe_address, trace_address="0"
+        )
+        # Test 404
+        wrong_transfer_id = (
+            "e3a6854140f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d592"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(wrong_transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Test getting ether incomming transfer
+        transfer_id = (
+            "i4f6754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d590"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        expected_result = {
+            "type": TransferType.ETHER_TRANSFER.name,
+            "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "blockNumber": internal_tx.ethereum_tx.block_id,
+            "transferId": transfer_id,
+            "transactionHash": internal_tx.ethereum_tx_id,
+            "to": safe_address,
+            "value": str(internal_tx.value),
+            "tokenId": None,
+            "tokenAddress": None,
+            "from": internal_tx._from,
+            "tokenInfo": None,
+        }
+        self.assertEqual(response.json(), expected_result)
+
+        # Test filtering ERC20 transfer by transfer_id
+        erc20_tx_hash = (
+            "0x406754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc20_tx = EthereumTxFactory(tx_hash=erc20_tx_hash)
+        ethereum_erc_20_event = ERC20TransferFactory(
+            ethereum_tx=erc20_tx, to=safe_address, log_index=20
+        )
+        token = TokenFactory(address=ethereum_erc_20_event.address)
+        transfer_id = (
+            "e406754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d5920"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        expected_result = {
+            "type": TransferType.ERC20_TRANSFER.name,
+            "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
+            "transferId": transfer_id,
+            "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
+            "to": safe_address,
+            "value": str(ethereum_erc_20_event.value),
+            "tokenId": None,
+            "tokenAddress": ethereum_erc_20_event.address,
+            "from": ethereum_erc_20_event._from,
+            "tokenInfo": {
+                "type": "ERC20",
+                "address": token.address,
+                "name": token.name,
+                "symbol": token.symbol,
+                "decimals": token.decimals,
+                "logoUri": token.get_full_logo_uri(),
+            },
+        }
+        self.assertEqual(response.json(), expected_result)
+
+        # Test filtering ERC721 transfer by transfer_id
+        token_id = 17
+        erc721_tx_hash = (
+            "0x306754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59"
+        )
+        erc721_tx = EthereumTxFactory(tx_hash=erc721_tx_hash)
+        ethereum_erc_721_event = ERC721TransferFactory(
+            ethereum_tx=erc721_tx, to=safe_address, token_id=token_id, log_index=721
+        )
+        transfer_id = (
+            "e306754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d59721"
+        )
+        response = self.client.get(
+            reverse("v1:history:transfer", args=(transfer_id,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        expected_result = {
+            "type": TransferType.ERC721_TRANSFER.name,
+            "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
+            "transferId": transfer_id,
+            "blockNumber": ethereum_erc_721_event.ethereum_tx.block_id,
+            "to": safe_address,
+            "value": None,
+            "tokenId": str(token_id),
+            "tokenAddress": ethereum_erc_721_event.address,
+            "from": ethereum_erc_721_event._from,
+            "tokenInfo": None,
+        }
+        self.assertEqual(response.json(), expected_result)
+
     def test_safe_creation_view(self):
         invalid_address = "0x2A"
         response = self.client.get(
@@ -2512,7 +2722,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
         with mock.patch.object(
-            ParityManager, "trace_transaction", autospec=True, return_value=[]
+            TracingManager, "trace_transaction", autospec=True, return_value=[]
         ):
             # Insert create contract internal tx
             internal_tx = InternalTxFactory(
@@ -2543,7 +2753,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         another_trace = dict(call_trace)
         another_trace["traceAddress"] = [0, 0, 0]
         with mock.patch.object(
-            ParityManager,
+            TracingManager,
             "trace_transaction",
             autospec=True,
             return_value=[another_trace],
@@ -2558,7 +2768,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         another_trace_2 = dict(call_trace)
         another_trace_2["traceAddress"] = [0]
         with mock.patch.object(
-            ParityManager,
+            TracingManager,
             "trace_transaction",
             autospec=True,
             return_value=[another_trace, another_trace_2],
@@ -2881,165 +3091,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response = self.client.get(reverse("v1:history:master-copies"))
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertCountEqual(response.data, expected_l2_master_copy)
-
-    def test_analytics_multisig_txs_by_origin_view(self):
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        origin = "Millennium Falcon Navigation Computer"
-        origin_2 = "HAL 9000"
-        multisig_transaction = MultisigTransactionFactory(origin=origin)
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-        for _ in range(3):
-            MultisigTransactionFactory(origin=origin_2)
-
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin_2, "transactions": 3},
-            {"origin": origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-        for _ in range(3):
-            MultisigTransactionFactory(origin=origin)
-
-        # Check sorting by the biggest
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin, "transactions": 4},
-            {"origin": origin_2, "transactions": 3},
-        ]
-        self.assertEqual(response.data, expected)
-
-        # Test filters
-        origin_3 = "Skynet"
-        safe_address = Account.create().address
-        MultisigTransactionFactory(origin=origin_3, safe=safe_address)
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-            + f"?safe={safe_address}"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": origin_3, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-origin")
-            + f"?to={multisig_transaction.to}"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
-            {"origin": multisig_transaction.origin, "transactions": 1},
-        ]
-        self.assertEqual(response.data, expected)
-
-    def test_analytics_multisig_txs_by_safe_view(self):
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        safe_address_1 = Account.create().address
-        safe_address_2 = Account.create().address
-        safe_address_3 = Account.create().address
-        MultisigTransactionFactory(safe=safe_address_1)
-        MultisigTransactionFactory(safe=safe_address_1)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(result["count"], 1)
-        self.assertEqual(
-            result["results"][0],
-            {"safe": safe_address_1, "masterCopy": None, "transactions": 2},
-        )
-        MultisigTransactionFactory(safe=safe_address_1)
-        safe_status_1 = SafeStatusFactory(address=safe_address_1)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(result["count"], 1)
-        self.assertIsNotNone(safe_status_1.master_copy)
-        self.assertEqual(
-            result["results"][0],
-            {
-                "safe": safe_address_1,
-                "masterCopy": safe_status_1.master_copy,
-                "transactions": 3,
-            },
-        )
-        MultisigTransactionFactory(safe=safe_address_2)
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-                {"safe": safe_address_2, "masterCopy": None, "transactions": 1},
-            ],
-        )
-        safe_status_2 = SafeStatusFactory(address=safe_address_2)
-        safe_status_3 = SafeStatusFactory(address=safe_address_3)
-        [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
-        response = self.client.get(reverse("v1:history:analytics-multisig-txs-by-safe"))
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_3,
-                    "masterCopy": safe_status_3.master_copy,
-                    "transactions": 4,
-                },
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-                {
-                    "safe": safe_address_2,
-                    "masterCopy": safe_status_2.master_copy,
-                    "transactions": 1,
-                },
-            ],
-        )
-
-        response = self.client.get(
-            reverse("v1:history:analytics-multisig-txs-by-safe")
-            + f"?master_copy={safe_status_1.master_copy}"
-        )
-        result = response.json()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            result["results"],
-            [
-                {
-                    "safe": safe_address_1,
-                    "masterCopy": safe_status_1.master_copy,
-                    "transactions": 3,
-                },
-            ],
-        )
 
     def test_modules_view(self):
         invalid_address = "0x2A"

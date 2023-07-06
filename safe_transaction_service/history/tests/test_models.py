@@ -24,6 +24,7 @@ from ..models import (
     EthereumBlockManager,
     EthereumTx,
     EthereumTxCallType,
+    IndexingStatus,
     InternalTx,
     InternalTxDecoded,
     MultisigConfirmation,
@@ -39,6 +40,7 @@ from .factories import (
     ERC721TransferFactory,
     EthereumBlockFactory,
     EthereumTxFactory,
+    IndexingStatusFactory,
     InternalTxDecodedFactory,
     InternalTxFactory,
     MultisigConfirmationFactory,
@@ -138,6 +140,45 @@ class TestModelMixins(TestCase):
                 another_generator, batch_size=2
             ),
             number,
+        )
+
+
+class TestIndexingStatus(TestCase):
+    def test_indexing_status(self):
+        indexing_status = IndexingStatus.objects.get()
+        self.assertEqual(str(indexing_status), "ERC20_721_EVENTS - 0")
+
+        with self.assertRaises(IntegrityError):
+            # IndexingStatus should be inserted with a migration and `indexing_type` is unique
+            IndexingStatusFactory(indexing_type=0)
+
+    def test_set_erc20_721_indexing_status(self):
+        self.assertTrue(IndexingStatus.objects.set_erc20_721_indexing_status(5))
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 5
+        )
+
+        self.assertTrue(IndexingStatus.objects.set_erc20_721_indexing_status(2))
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 2
+        )
+
+        self.assertTrue(
+            IndexingStatus.objects.set_erc20_721_indexing_status(
+                10, from_block_number=2
+            )
+        )
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 10
+        )
+
+        self.assertFalse(
+            IndexingStatus.objects.set_erc20_721_indexing_status(
+                20, from_block_number=11
+            )
+        )
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 10
         )
 
 
@@ -289,7 +330,7 @@ class TestEthereumTx(TestCase):
             with self.subTest(tx_mock=tx_mock):
                 tx_dict = tx_mock["tx"]
                 ethereum_tx = EthereumTx.objects.create_from_tx_dict(tx_dict)
-                self.assertEqual(ethereum_tx.type, int(tx_dict["type"], 0))
+                self.assertEqual(ethereum_tx.type, tx_dict["type"], 0)
                 self.assertEqual(ethereum_tx.gas_price, tx_dict["gasPrice"])
                 self.assertEqual(
                     ethereum_tx.max_fee_per_gas, tx_dict.get("maxFeePerGas")
@@ -685,6 +726,51 @@ class TestInternalTxDecoded(TestCase):
             InternalTxDecoded.objects.safes_pending_to_be_processed(), [safe_address_1]
         )
 
+    def test_out_of_order_for_safe(self):
+        random_safe = Account.create().address
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        i = InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=10,
+            processed=False,
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        i.set_processed()
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=11,
+            processed=False,
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=9, processed=False
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+        i.processed = False
+        i.save(update_fields=["processed"])
+
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=8, processed=True
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=9, processed=True
+        )
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe, internal_tx__block_number=10, processed=True
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
 
 class TestLastSafeStatus(TestCase):
     def test_insert(self):
@@ -855,6 +941,19 @@ class TestSafeLastStatus(TestCase):
         SafeLastStatus.objects.all().delete()
         SafeLastStatusFactory(address=address, nonce=17)
         self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 17)
+
+    def test_is_corrupted(self):
+        address = Account.create().address
+        SafeStatusFactory(address=address, nonce=0)
+        SafeStatusFactory(address=address, nonce=2)
+        safe_last_status = SafeLastStatus.objects.get_or_generate(address)
+        self.assertTrue(safe_last_status.is_corrupted())
+
+        SafeStatusFactory(address=address, nonce=1)
+        self.assertFalse(safe_last_status.is_corrupted())
+
+        SafeStatus.objects.all().delete()
+        self.assertFalse(safe_last_status.is_corrupted())
 
 
 class TestSafeStatus(TestCase):
@@ -1278,6 +1377,69 @@ class TestMultisigTransactions(TestCase):
         ContractFactory(address=multisig_transaction.to)
         self.assertFalse(
             MultisigTransaction.objects.not_indexed_metadata_contract_addresses()
+        )
+
+    def test_with_confirmations_required(self):
+        # This should never be picked
+        SafeStatusFactory(nonce=0, threshold=4)
+
+        multisig_transaction = MultisigTransactionFactory()
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        # SafeStatus not matching the EthereumTx
+        safe_status = SafeStatusFactory(nonce=1, threshold=8)
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        safe_status.internal_tx.ethereum_tx = multisig_transaction.ethereum_tx
+        safe_status.internal_tx.save(update_fields=["ethereum_tx"])
+
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            8,
+        )
+
+        # It will not be picked, as EthereumTx is not matching
+        SafeStatusFactory(nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            8,
+        )
+
+        # As EthereumTx is empty, the latest safe status will be used if available
+        multisig_transaction.ethereum_tx = None
+        multisig_transaction.save(update_fields=["ethereum_tx"])
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        # Not matching address should not return anything
+        SafeLastStatusFactory(nonce=2, threshold=16)
+        self.assertIsNone(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required
+        )
+
+        SafeLastStatusFactory(address=multisig_transaction.safe, nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            15,
         )
 
     def test_with_confirmations(self):

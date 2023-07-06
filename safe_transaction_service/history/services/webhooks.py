@@ -18,7 +18,7 @@ from safe_transaction_service.history.models import (
     TokenTransfer,
     WebHookType,
 )
-from safe_transaction_service.utils.ethereum import get_ethereum_network
+from safe_transaction_service.utils.ethereum import get_chain_id
 
 
 def build_webhook_payload(
@@ -107,7 +107,7 @@ def build_webhook_payload(
 
     # Add chainId to every payload
     for payload in payloads:
-        payload["chainId"] = str(get_ethereum_network().value)
+        payload["chainId"] = str(get_chain_id())
 
     return payloads
 
@@ -134,7 +134,11 @@ def is_relevant_notification(
     if (
         sender == MultisigTransaction
     ):  # Different logic, as `MultisigTransaction` can change from Pending to Executed
-        if instance.modified + timedelta(minutes=minutes) < timezone.now():
+        # Don't send notifications for `not trusted` transactions
+        if (
+            not instance.trusted
+            or instance.modified + timedelta(minutes=minutes) < timezone.now()
+        ):
             return False
     elif not created:
         return False

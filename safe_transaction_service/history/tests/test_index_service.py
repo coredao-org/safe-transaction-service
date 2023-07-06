@@ -9,7 +9,13 @@ from web3 import Web3
 from gnosis.eth import EthereumClient
 from gnosis.eth.tests.ethereum_test_case import EthereumTestCaseMixin
 
-from ..models import EthereumTx, MultisigTransaction, SafeContract, SafeStatus
+from ..models import (
+    EthereumTx,
+    IndexingStatus,
+    MultisigTransaction,
+    SafeLastStatus,
+    SafeStatus,
+)
 from ..services.index_service import (
     IndexService,
     IndexServiceProvider,
@@ -18,7 +24,6 @@ from ..services.index_service import (
 from .factories import (
     EthereumTxFactory,
     MultisigTransactionFactory,
-    SafeContractFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
@@ -94,6 +99,7 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
         EthereumClient, "current_block_number", new_callable=PropertyMock
     )
     def test_is_service_synced(self, current_block_number_mock: PropertyMock):
+        IndexingStatus.objects.set_erc20_721_indexing_status(500)
         current_block_number_mock.return_value = 500
         self.assertTrue(self.index_service.is_service_synced())
         reorg_blocks = self.index_service.eth_reorg_blocks
@@ -106,38 +112,24 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
         safe_master_copy.save(update_fields=["tx_block_number"])
         self.assertTrue(self.index_service.is_service_synced())
 
-        safe_contract = SafeContractFactory(
-            erc20_block_number=current_block_number_mock.return_value - reorg_blocks - 1
+        IndexingStatus.objects.set_erc20_721_indexing_status(
+            current_block_number_mock.return_value - reorg_blocks - 1
         )
         self.assertFalse(self.index_service.is_service_synced())
-        safe_contract.erc20_block_number = safe_contract.erc20_block_number + 1
-        safe_contract.save(update_fields=["erc20_block_number"])
-        self.assertTrue(self.index_service.is_service_synced())
-
-        # Less than 10% of contracts out of sync will be alright (by default). Try with 1 of 20 out of sync
-        SafeContract.objects.all().delete()
-        SafeContractFactory(
-            erc20_block_number=current_block_number_mock.return_value - reorg_blocks - 1
+        IndexingStatus.objects.set_erc20_721_indexing_status(
+            current_block_number_mock.return_value - reorg_blocks
         )
-        for _ in range(19):
-            safe_contract_synced = SafeContractFactory(
-                erc20_block_number=current_block_number_mock.return_value - reorg_blocks
-            )
         self.assertTrue(self.index_service.is_service_synced())
-
-        # Set one more of sync, so 2 of 20 out of sync
-        safe_contract_synced.erc20_block_number -= 1
-        safe_contract_synced.save(update_fields=["erc20_block_number"])
-        self.assertFalse(self.index_service.is_service_synced())
 
     def test_reprocess_addresses(self):
         index_service: IndexService = self.index_service
         self.assertIsNone(index_service.reprocess_addresses([]))
 
         safe_status = SafeStatusFactory()
+        SafeLastStatus.objects.get_or_generate(safe_status.address)
         MultisigTransactionFactory()  # It shouldn't be deleted (safe not matching)
         MultisigTransactionFactory(
-            safe=safe_status.address, origin=None
+            safe=safe_status.address, origin={}
         )  # It should be deleted
         MultisigTransactionFactory(
             safe=safe_status.address, ethereum_tx=None
@@ -148,19 +140,21 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 4)
         self.assertIsNone(index_service.reprocess_addresses([safe_status.address]))
         self.assertEqual(SafeStatus.objects.count(), 0)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
         self.assertEqual(MultisigTransaction.objects.count(), 3)
 
     def test_reprocess_all(self):
         index_service: IndexService = self.index_service
         for _ in range(5):
             safe_status = SafeStatusFactory()
-            MultisigTransactionFactory(safe=safe_status.address, origin=None)
-            MultisigTransactionFactory(safe=safe_status.address, origin="")
+            SafeLastStatus.objects.get_or_generate(safe_status.address)
+            MultisigTransactionFactory(safe=safe_status.address, origin={})
 
         MultisigTransactionFactory(ethereum_tx=None)  # It shouldn't be deleted
         MultisigTransactionFactory(origin="Something")  # It shouldn't be deleted
 
-        self.assertEqual(MultisigTransaction.objects.count(), 12)
+        self.assertEqual(MultisigTransaction.objects.count(), 7)
         self.assertIsNone(index_service.reprocess_all())
         self.assertEqual(SafeStatus.objects.count(), 0)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
         self.assertEqual(MultisigTransaction.objects.count(), 2)

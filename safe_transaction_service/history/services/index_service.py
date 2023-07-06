@@ -1,27 +1,45 @@
 import logging
+from dataclasses import dataclass
 from typing import Collection, List, Optional, OrderedDict, Union
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Min, Q
 
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
 
 from gnosis.eth import EthereumClient, EthereumClientProvider
 
+from ..models import EthereumBlock, EthereumTx
+from ..models import IndexingStatus as IndexingStatusDb
 from ..models import (
-    EthereumBlock,
-    EthereumTx,
     InternalTxDecoded,
     ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
-    SafeContract,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class IndexingStatus:
+    current_block_number: int
+    erc20_block_number: int
+    erc20_synced: bool
+    master_copies_block_number: int
+    master_copies_synced: bool
+    synced: bool
+
+
+@dataclass
+class ERC20IndexingStatus:
+    current_block_number: int
+    erc20_block_number: int
+    erc20_synced: bool
 
 
 class IndexingException(Exception):
@@ -49,7 +67,6 @@ class IndexServiceProvider:
                 EthereumClientProvider(),
                 settings.ETH_REORG_BLOCKS,
                 settings.ETH_L2_NETWORK,
-                settings.ALERT_OUT_OF_SYNC_EVENTS_THRESHOLD,
             )
         return cls.instance
 
@@ -66,12 +83,10 @@ class IndexService:
         ethereum_client: EthereumClient,
         eth_reorg_blocks: int,
         eth_l2_network: bool,
-        alert_out_of_sync_events_threshold: float,
     ):
         self.ethereum_client = ethereum_client
         self.eth_reorg_blocks = eth_reorg_blocks
         self.eth_l2_network = eth_l2_network
-        self.alert_out_of_sync_events_threshold = alert_out_of_sync_events_threshold
 
     def block_get_or_create_from_block_hash(self, block_hash: int):
         try:
@@ -88,6 +103,49 @@ class IndexService:
                 block, confirmed=confirmed
             )
 
+    def get_erc20_721_current_indexing_block_number(self) -> int:
+        return IndexingStatusDb.objects.get_erc20_721_indexing_status().block_number
+
+    def get_master_copies_current_indexing_block_number(self) -> Optional[int]:
+        return SafeMasterCopy.objects.relevant().aggregate(
+            min_master_copies_block_number=Min("tx_block_number")
+        )["min_master_copies_block_number"]
+
+    def get_indexing_status(self) -> IndexingStatus:
+        current_block_number = self.ethereum_client.current_block_number
+
+        # Indexing points to the next block to be indexed, we need the previous ones
+        erc20_block_number = min(
+            max(self.get_erc20_721_current_indexing_block_number() - 1, 0),
+            current_block_number,
+        )
+
+        if (
+            master_copies_current_indexing_block_number := self.get_master_copies_current_indexing_block_number()
+        ) is None:
+            master_copies_block_number = current_block_number
+        else:
+            master_copies_block_number = min(
+                max(master_copies_current_indexing_block_number - 1, 0),
+                current_block_number,
+            )
+
+        erc20_synced = (
+            current_block_number - erc20_block_number <= self.eth_reorg_blocks
+        )
+        master_copies_synced = (
+            current_block_number - master_copies_block_number <= self.eth_reorg_blocks
+        )
+
+        return IndexingStatus(
+            current_block_number=current_block_number,
+            erc20_block_number=erc20_block_number,
+            erc20_synced=erc20_synced,
+            master_copies_block_number=master_copies_block_number,
+            master_copies_synced=master_copies_synced,
+            synced=erc20_synced and master_copies_synced,
+        )
+
     def is_service_synced(self) -> bool:
         """
         :return: `True` if master copies and ERC20/721 are synced, `False` otherwise
@@ -97,26 +155,16 @@ class IndexService:
         reference_block_number = (
             self.ethereum_client.current_block_number - self.eth_reorg_blocks
         )
-        synced = True
+        synced: bool = True
         for safe_master_copy in SafeMasterCopy.objects.relevant().filter(
             tx_block_number__lt=reference_block_number
         ):
             logger.error("Master Copy %s is out of sync", safe_master_copy.address)
             synced = False
 
-        out_of_sync_contracts = SafeContract.objects.filter(
-            erc20_block_number__lt=reference_block_number
-        ).count()
-        if out_of_sync_contracts > 0:
-            total_number_of_contracts = SafeContract.objects.all().count()
-            proportion_out_of_sync = out_of_sync_contracts / total_number_of_contracts
-            # Ignore less than 10% of contracts out of sync
-            if proportion_out_of_sync >= self.alert_out_of_sync_events_threshold:
-                logger.error(
-                    "%d Safe Contracts have ERC20/721 out of sync",
-                    out_of_sync_contracts,
-                )
-                synced = False
+        if self.get_erc20_721_current_indexing_block_number() < reference_block_number:
+            logger.error("Safe Contracts have ERC20/721 out of sync")
+            synced = False
 
         return synced
 
@@ -144,6 +192,8 @@ class IndexService:
     def txs_create_or_update_from_tx_hashes(
         self, tx_hashes: Collection[Union[str, bytes]]
     ) -> List["EthereumTx"]:
+
+        logger.debug("Don't retrieve existing txs on DB. Find them first")
         # Search first in database
         ethereum_txs_dict = OrderedDict.fromkeys(
             [HexBytes(tx_hash).hex() for tx_hash in tx_hashes]
@@ -153,6 +203,7 @@ class IndexService:
         )
         for db_ethereum_tx in db_ethereum_txs:
             ethereum_txs_dict[db_ethereum_tx.tx_hash] = db_ethereum_tx
+        logger.debug("Found %d existing txs on DB", len(db_ethereum_txs))
 
         # Retrieve from the node the txs missing from database
         tx_hashes_not_in_db = [
@@ -160,10 +211,12 @@ class IndexService:
             for tx_hash, ethereum_tx in ethereum_txs_dict.items()
             if not ethereum_tx
         ]
+        logger.debug("Retrieve from RPC %d missing txs on DB", len(tx_hashes_not_in_db))
         if not tx_hashes_not_in_db:
             return list(ethereum_txs_dict.values())
 
         # Get receipts for hashes not in db
+        logger.debug("Get tx receipts for hashes not on db")
         tx_receipts = []
         for tx_hash, tx_receipt in zip(
             tx_hashes_not_in_db,
@@ -185,6 +238,7 @@ class IndexService:
 
             tx_receipts.append(tx_receipt)
 
+        logger.debug("Got tx receipts. Now getting transactions not on db")
         # Get transactions for hashes not in db
         fetched_txs = self.ethereum_client.get_transactions(tx_hashes_not_in_db)
         block_hashes = set()
@@ -206,6 +260,7 @@ class IndexService:
 
             block_hashes.add(tx["blockHash"].hex())
             txs.append(tx)
+        logger.debug("Got txs from RPC. Getting %d blocks", len(block_hashes))
 
         blocks = self.ethereum_client.get_blocks(block_hashes)
         block_dict = {}
@@ -219,6 +274,10 @@ class IndexService:
                 )
             assert block_hash == block["hash"].hex()
             block_dict[block["hash"]] = block
+
+        logger.debug(
+            "Got blocks from RPC. Inserting blocks. Creating txs or updating them if they have not receipt"
+        )
 
         # Create new transactions or update them if they have no receipt
         current_block_number = self.ethereum_client.current_block_number
@@ -243,6 +302,7 @@ class IndexService:
                 # For txs stored before being mined
                 ethereum_tx.update_with_block_and_receipt(ethereum_block, tx_receipt)
                 ethereum_txs_dict[ethereum_tx.tx_hash] = ethereum_tx
+        logger.debug("Blocks, transactions and receipts were inserted")
         return list(ethereum_txs_dict.values())
 
     @transaction.atomic
@@ -260,7 +320,7 @@ class IndexService:
 
         logger.info("Remove transactions automatically indexed")
         queryset = MultisigTransaction.objects.exclude(ethereum_tx=None).filter(
-            Q(origin=None) | Q(origin="")
+            Q(origin__exact={})
         )
         if addresses:
             queryset = queryset.filter(safe__in=addresses)
@@ -273,8 +333,13 @@ class IndexService:
         queryset.delete()
 
         logger.info("Remove Safe statuses")
-
         queryset = SafeStatus.objects.all()
+        if addresses:
+            queryset = queryset.filter(address__in=addresses)
+        queryset.delete()
+
+        logger.info("Remove Safe Last statuses")
+        queryset = SafeLastStatus.objects.all()
         if addresses:
             queryset = queryset.filter(address__in=addresses)
         queryset.delete()
@@ -310,7 +375,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        :param provider:
+        :param indexer: A new instance must be provider, providing the singleton one can break indexing
         :param from_block_number:
         :param to_block_number:
         :param block_process_limit:
@@ -319,16 +384,10 @@ class IndexService:
         """
         assert (not to_block_number) or to_block_number > from_block_number
 
-        ignore_addresses_on_log_filter = (
-            indexer.IGNORE_ADDRESSES_ON_LOG_FILTER
-            if hasattr(indexer, "IGNORE_ADDRESSES_ON_LOG_FILTER")
-            else None
-        )
-
         if addresses:
-            indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = (
-                False  # Just process addresses provided
-            )
+            # Just process addresses provided
+            # No issues on modifying the indexer as we should be provided with a new instance
+            indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = False
         else:
             addresses = list(
                 indexer.database_queryset.values_list("address", flat=True)
@@ -338,7 +397,11 @@ class IndexService:
         if not addresses:
             logger.warning("No addresses to process")
         else:
-            logger.info("Start reindexing addresses %s", addresses)
+            # Don't log all the addresses
+            addresses_str = (
+                str(addresses) if len(addresses) < 10 else f"{addresses[:10]}..."
+            )
+            logger.info("Start reindexing addresses %s", addresses_str)
             current_block_number = self.ethereum_client.current_block_number
             stop_block_number = (
                 min(current_block_number, to_block_number)
@@ -363,8 +426,6 @@ class IndexService:
 
             logger.info("End reindexing addresses %s", addresses)
 
-        # We changed attributes on the indexer, so better restore it
-        indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = ignore_addresses_on_log_filter
         return element_number
 
     def reindex_master_copies(
@@ -389,10 +450,10 @@ class IndexService:
         from ..indexers import InternalTxIndexerProvider, SafeEventsIndexerProvider
 
         indexer = (
-            SafeEventsIndexerProvider
+            SafeEventsIndexerProvider.get_new_instance()
             if self.eth_l2_network
-            else InternalTxIndexerProvider
-        )()
+            else InternalTxIndexerProvider.get_new_instance()
+        )
 
         return self._reindex(
             indexer,
@@ -422,7 +483,7 @@ class IndexService:
 
         from ..indexers import Erc20EventsIndexerProvider
 
-        indexer = Erc20EventsIndexerProvider()
+        indexer = Erc20EventsIndexerProvider.get_new_instance()
         return self._reindex(
             indexer,
             from_block_number,

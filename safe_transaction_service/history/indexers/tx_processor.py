@@ -10,11 +10,13 @@ from hexbytes import HexBytes
 from packaging.version import Version
 from web3 import Web3
 
-from gnosis.eth import EthereumClient
+from gnosis.eth import EthereumClient, EthereumClientProvider
 from gnosis.eth.constants import NULL_ADDRESS
 from gnosis.eth.contracts import get_safe_V1_0_0_contract, get_safe_V1_3_0_contract
 from gnosis.safe import SafeTx
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureApprovedHash
+
+from safe_transaction_service.safe_messages import models as safe_message_models
 
 from ..models import (
     EthereumTx,
@@ -45,12 +47,13 @@ class SafeTxProcessorProvider:
         if not hasattr(cls, "instance"):
             from django.conf import settings
 
-            node_url = (
-                settings.ETHEREUM_TRACING_NODE_URL
+            ethereum_client = EthereumClientProvider()
+            ethereum_tracing_client = (
+                EthereumClient(settings.ETHEREUM_TRACING_NODE_URL)
                 if settings.ETHEREUM_TRACING_NODE_URL
-                else settings.ETHEREUM_NODE_URL
+                else None
             )
-            cls.instance = SafeTxProcessor(EthereumClient(node_url))
+            cls.instance = SafeTxProcessor(ethereum_client, ethereum_tracing_client)
         return cls.instance
 
     @classmethod
@@ -80,9 +83,20 @@ class SafeTxProcessor(TxProcessor):
     Processor for txs on Safe Contracts v0.0.1 - v1.0.0
     """
 
-    def __init__(self, ethereum_client: EthereumClient):
+    def __init__(
+        self,
+        ethereum_client: EthereumClient,
+        ethereum_tracing_client: Optional[EthereumClient],
+    ):
+        """
+        :param ethereum_client: Used for regular RPC calls
+        :param ethereum_tracing_client: Used for RPC calls requiring trace methods. It's required to get
+           previous traces for a given `InternalTx` if not found on database
+        """
+
         # This safe_tx_failure events allow us to detect a failed safe transaction
         self.ethereum_client = ethereum_client
+        self.ethereum_tracing_client = ethereum_tracing_client
         dummy_w3 = Web3()
         self.safe_tx_failure_events = [
             get_safe_V1_0_0_contract(dummy_w3).events.ExecutionFailed(),
@@ -99,7 +113,7 @@ class SafeTxProcessor(TxProcessor):
             event_abi_to_log_topic(event.abi)
             for event in self.safe_tx_module_failure_events
         }
-        self.safe_last_status_cache: Dict[str, SafeStatus] = {}
+        self.safe_last_status_cache: Dict[str, SafeLastStatus] = {}
         self.signature_breaking_versions = (  # Versions where signing changed
             Version("1.0.0"),  # Safes >= 1.0.0 Renamed `baseGas` to `dataGas`
             Version("1.3.0"),  # ChainId was included
@@ -235,9 +249,10 @@ class SafeTxProcessor(TxProcessor):
         MultisigConfirmation.objects.remove_unused_confirmations(
             contract_address, safe_status.nonce, owner
         )
+        safe_message_models.SafeMessageConfirmation.objects.filter(owner=owner).delete()
 
     def store_new_safe_status(
-        self, safe_last_status: SafeStatus, internal_tx: InternalTx
+        self, safe_last_status: SafeLastStatus, internal_tx: InternalTx
     ) -> SafeLastStatus:
         """
         Updates `SafeLastStatus`. An entry to `SafeStatus` is added too via a Django signal.
@@ -323,23 +338,13 @@ class SafeTxProcessor(TxProcessor):
                 safe_contract: SafeContract = SafeContract.objects.get(
                     address=contract_address
                 )
-                if (
-                    not safe_contract.ethereum_tx_id
-                    or not safe_contract.erc20_block_number
-                ):
+                if not safe_contract.ethereum_tx_id:
                     safe_contract.ethereum_tx = internal_tx.ethereum_tx
-                    safe_contract.erc20_block_number = internal_tx.block_number
-                    safe_contract.save(
-                        update_fields=["ethereum_tx", "erc20_block_number"]
-                    )
+                    safe_contract.save(update_fields=["ethereum_tx"])
             except SafeContract.DoesNotExist:
-                blocks_one_day = int(24 * 60 * 60 / 15)  # 15 seconds block
                 SafeContract.objects.create(
                     address=contract_address,
                     ethereum_tx=internal_tx.ethereum_tx,
-                    erc20_block_number=max(
-                        internal_tx.block_number - blocks_one_day, 0
-                    ),
                 )
                 logger.info("Found new Safe=%s", contract_address)
 
@@ -444,11 +449,13 @@ class SafeTxProcessor(TxProcessor):
                 else:
                     # Regular Safe indexed using tracing
                     # Someone calls Module -> Module calls Safe Proxy -> Safe Proxy delegate calls Master Copy
-                    # The trace that is been processed is the last one, so indexer needs to get the previous trace
-                    previous_trace = self.ethereum_client.parity.get_previous_trace(
-                        internal_tx.ethereum_tx_id,
-                        internal_tx.trace_address_as_list,
-                        skip_delegate_calls=True,
+                    # The trace that is being processed is the last one, so indexer needs to get the previous trace
+                    previous_trace = (
+                        self.ethereum_tracing_client.tracing.get_previous_trace(
+                            internal_tx.ethereum_tx_id,
+                            internal_tx.trace_address_as_list,
+                            skip_delegate_calls=True,
+                        )
                     )
                     if not previous_trace:
                         message = (
@@ -488,10 +495,12 @@ class SafeTxProcessor(TxProcessor):
                 if "owner" in arguments:  # Event approveHash
                     owner = arguments["owner"]
                 else:
-                    previous_trace = self.ethereum_client.parity.get_previous_trace(
-                        internal_tx.ethereum_tx_id,
-                        internal_tx.trace_address_as_list,
-                        skip_delegate_calls=True,
+                    previous_trace = (
+                        self.ethereum_tracing_client.tracing.get_previous_trace(
+                            internal_tx.ethereum_tx_id,
+                            internal_tx.trace_address_as_list,
+                            skip_delegate_calls=True,
+                        )
                     )
                     if not previous_trace:
                         message = (

@@ -7,8 +7,15 @@ from eth_account import Account
 from eth_utils import keccak
 from web3 import Web3
 
-from gnosis.eth.ethereum_client import ParityManager
+from gnosis.eth.ethereum_client import TracingManager
 from gnosis.safe.safe_signature import SafeSignatureType
+from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
+
+from safe_transaction_service.safe_messages.models import SafeMessageConfirmation
+from safe_transaction_service.safe_messages.tests.factories import (
+    SafeMessageConfirmationFactory,
+    SafeMessageFactory,
+)
 
 from ..indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
 from ..models import (
@@ -33,7 +40,7 @@ from .mocks.traces import call_trace, module_traces, rinkeby_traces
 logger = logging.getLogger(__name__)
 
 
-class TestSafeTxProcessor(TestCase):
+class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -117,7 +124,7 @@ class TestSafeTxProcessor(TestCase):
         self.assertEqual(safe_status.threshold, threshold)
 
         threshold = 1
-        # Check deleting the owner did delete this pending confirmation
+        # Check deleting the owner did delete this pending confirmation for both signature and transaction
         # It will insert a transaction we will remove after we check the confirmation was deleted
         unused_multisig_confirmation = MultisigConfirmationFactory(
             owner=another_owner,
@@ -125,6 +132,16 @@ class TestSafeTxProcessor(TestCase):
             multisig_transaction__nonce=safe_status.nonce + 1,
             multisig_transaction__safe=safe_address,
         )
+        # This will be deleted
+        safe_message = SafeMessageFactory(safe=self.deploy_test_safe().address)
+        unused_message_confirmation = SafeMessageConfirmationFactory(
+            owner=another_owner, safe_message=safe_message
+        )
+        # This won't be deleted
+        unused_message_confirmation_2 = SafeMessageConfirmationFactory(
+            safe_message=unused_message_confirmation.safe_message
+        )
+        self.assertEqual(SafeMessageConfirmation.objects.count(), 2)
         number_confirmations = MultisigConfirmation.objects.count()
         tx_processor.process_decoded_transactions(
             [
@@ -144,6 +161,12 @@ class TestSafeTxProcessor(TestCase):
             MultisigConfirmation.objects.count(), number_confirmations + 1 - 1
         )
         unused_multisig_confirmation.multisig_transaction.delete()  # Remove this transaction inserted manually
+        self.assertEqual(SafeMessageConfirmation.objects.count(), 1)
+        self.assertTrue(
+            SafeMessageConfirmation.objects.filter(
+                owner=unused_message_confirmation_2.owner
+            ).exists()
+        )
         self.assertEqual(SafeStatus.objects.count(), 7)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
@@ -230,7 +253,7 @@ class TestSafeTxProcessor(TestCase):
         self.assertEqual(safe_status.nonce, 7)
 
         with mock.patch.object(
-            ParityManager,
+            TracingManager,
             "trace_transaction",
             autospec=True,
             return_value=rinkeby_traces,
@@ -276,7 +299,7 @@ class TestSafeTxProcessor(TestCase):
         # Not needed
         # approve_hash_call_trace['transactionHash'] = approve_hash_decoded_tx.internal_tx.ethereum_tx_id
         with mock.patch.object(
-            ParityManager,
+            TracingManager,
             "trace_transaction",
             autospec=True,
             return_value=[approve_hash_previous_call_trace],
@@ -444,7 +467,7 @@ class TestSafeTxProcessor(TestCase):
             self.assertEqual(ModuleTransaction.objects.count(), 0)
 
         with mock.patch.object(
-            ParityManager,
+            TracingManager,
             "trace_transaction",
             autospec=True,
             return_value=module_traces,

@@ -8,7 +8,7 @@ from django.test import TestCase
 from eth_typing import HexStr
 
 from gnosis.eth import EthereumClient
-from gnosis.eth.ethereum_client import ParityManager
+from gnosis.eth.ethereum_client import TracingManager
 
 from ..indexers import InternalTxIndexer, InternalTxIndexerProvider
 from ..indexers.internal_tx_indexer import InternalTxIndexerWithTraceBlock
@@ -16,6 +16,7 @@ from ..indexers.tx_processor import SafeTxProcessorProvider
 from ..models import (
     EthereumBlock,
     EthereumTx,
+    IndexingStatus,
     InternalTx,
     InternalTxDecoded,
     SafeContract,
@@ -23,7 +24,7 @@ from ..models import (
     SafeMasterCopy,
     SafeStatus,
 )
-from .factories import SafeMasterCopyFactory
+from .factories import EthereumTxFactory, SafeMasterCopyFactory
 from .mocks.mocks_internal_tx_indexer import (
     block_result,
     trace_blocks_filtered_0x5aC2_result,
@@ -36,15 +37,12 @@ from .mocks.mocks_internal_tx_indexer import (
 
 
 class TestInternalTxIndexer(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.internal_tx_indexer = InternalTxIndexerProvider()
-        cls.internal_tx_indexer.blocks_to_reindex_again = 0
+    def setUp(self) -> None:
+        InternalTxIndexerProvider.del_singleton()
+        self.internal_tx_indexer = InternalTxIndexerProvider()
+        self.internal_tx_indexer.blocks_to_reindex_again = 0
 
-    @classmethod
-    def tearDownClass(cls):
-        super().tearDownClass()
+    def tearDown(self) -> None:
         InternalTxIndexerProvider.del_singleton()
 
     def test_internal_tx_indexer_provider(self):
@@ -60,17 +58,23 @@ class TestInternalTxIndexer(TestCase):
             )
 
     def return_sorted_blocks(self, hashes: HexStr):
+        """
+        Mock function helper
+
+        :param hashes:
+        :return:
+        """
         block_dict = {block["hash"].hex(): block for block in block_result}
         return [block_dict[provided_hash] for provided_hash in hashes]
 
     @mock.patch.object(
-        ParityManager, "trace_blocks", autospec=True, return_value=trace_blocks_result
+        TracingManager, "trace_blocks", autospec=True, return_value=trace_blocks_result
     )
     @mock.patch.object(
-        ParityManager, "trace_filter", autospec=True, return_value=trace_filter_result
+        TracingManager, "trace_filter", autospec=True, return_value=trace_filter_result
     )
     @mock.patch.object(
-        ParityManager,
+        TracingManager,
         "trace_transactions",
         autospec=True,
         return_value=trace_transactions_result,
@@ -115,13 +119,15 @@ class TestInternalTxIndexer(TestCase):
         )
         self.assertIsNone(current_block_number_mock.assert_called_with())
 
-        internal_tx_indexer.start()  # No SafeMasterCopy to index
+        self.assertEqual(
+            internal_tx_indexer.start(), (0, 0)
+        )  # No SafeMasterCopy to index
 
         safe_master_copy: SafeMasterCopy = SafeMasterCopyFactory(
             address="0x5aC255889882aCd3da2aA939679E3f3d4cea221e"
         )
         self.assertEqual(safe_master_copy.tx_block_number, 0)
-        internal_tx_indexer.start()
+        self.assertEqual(internal_tx_indexer.start(), (3, 2001))
 
         self.assertEqual(EthereumTx.objects.count(), len(transactions_result))
         self.assertEqual(EthereumBlock.objects.count(), len(block_result))
@@ -156,16 +162,16 @@ class TestInternalTxIndexer(TestCase):
         self.assertEqual(ethereum_tx.logs, [])
 
         trace_filter_mock.assert_called_once_with(
-            internal_tx_indexer.ethereum_client.parity,
-            from_block=1,
+            internal_tx_indexer.ethereum_client.tracing,
+            from_block=0,
             to_block=current_block_number - internal_tx_indexer.number_trace_blocks,
             to_address=[safe_master_copy.address],
         )
         trace_block_mock.assert_called_with(
-            internal_tx_indexer.ethereum_client.parity,
+            internal_tx_indexer.ethereum_client.tracing,
             list(
                 range(
-                    current_block_number - internal_tx_indexer.number_trace_blocks,
+                    current_block_number - internal_tx_indexer.number_trace_blocks + 1,
                     current_block_number + 1 - internal_tx_indexer.confirmations,
                 )
             ),
@@ -175,13 +181,13 @@ class TestInternalTxIndexer(TestCase):
         self._test_internal_tx_indexer()
 
     @mock.patch.object(
-        ParityManager,
+        TracingManager,
         "trace_blocks",
         autospec=True,
         return_value=trace_blocks_filtered_0x5aC2_result,
     )
     @mock.patch.object(
-        ParityManager, "trace_filter", autospec=True, return_value=trace_filter_result
+        TracingManager, "trace_filter", autospec=True, return_value=trace_filter_result
     )
     @mock.patch.object(
         EthereumClient,
@@ -217,7 +223,7 @@ class TestInternalTxIndexer(TestCase):
         )
         self.assertEqual(trace_filter_transactions, elements)
         trace_filter_mock.assert_called_once_with(
-            internal_tx_indexer.ethereum_client.parity,
+            internal_tx_indexer.ethereum_client.tracing,
             from_block=1,
             to_block=current_block_number - 50,
             to_address=addresses,
@@ -229,22 +235,19 @@ class TestInternalTxIndexer(TestCase):
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, current_block_number - 50, current_block_number
         )
-        print(trace_filter_transactions | trace_block_transactions)
-        print()
-        print(elements)
         self.assertEqual(trace_filter_transactions | trace_block_transactions, elements)
         trace_filter_mock.assert_called_once_with(
-            internal_tx_indexer.ethereum_client.parity,
+            internal_tx_indexer.ethereum_client.tracing,
             from_block=current_block_number - 50,
             to_block=current_block_number - internal_tx_indexer.number_trace_blocks,
             to_address=addresses,
         )
 
         trace_block_mock.assert_called_with(
-            internal_tx_indexer.ethereum_client.parity,
+            internal_tx_indexer.ethereum_client.tracing,
             list(
                 range(
-                    current_block_number - internal_tx_indexer.number_trace_blocks,
+                    current_block_number - internal_tx_indexer.number_trace_blocks + 1,
                     current_block_number + 1,
                 )
             ),
@@ -261,7 +264,7 @@ class TestInternalTxIndexer(TestCase):
         trace_filter_mock.assert_not_called()
 
         trace_block_mock.assert_called_with(
-            internal_tx_indexer.ethereum_client.parity,
+            internal_tx_indexer.ethereum_client.tracing,
             list(range(current_block_number - 3, current_block_number + 1)),
         )
 
@@ -307,16 +310,51 @@ class TestInternalTxIndexer(TestCase):
         tx_processor.process_decoded_transactions(
             InternalTxDecoded.objects.pending_for_safes()
         )
-        safe_contract: SafeContract = SafeContract.objects.first()
-        self.assertGreater(safe_contract.erc20_block_number, 0)
-        safe_contract.erc20_block_number = 0
-        safe_contract.save(update_fields=["erc20_block_number"])
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
 
         SafeStatus.objects.all().delete()
         InternalTxDecoded.objects.update(processed=False)
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
         self.assertEqual(internal_txs_decoded.count(), 2)
         self.assertEqual(internal_txs_decoded[0].function_name, "setup")
-        tx_processor.process_decoded_transactions(internal_txs_decoded)
-        safe_contract.refresh_from_db()
-        self.assertGreater(safe_contract.erc20_block_number, 0)
+        results = tx_processor.process_decoded_transactions(internal_txs_decoded)
+        self.assertEqual(results, [True, True])
+
+    def test_element_already_processed_checker(self):
+        """
+        Test not reprocessing of processed events
+        """
+
+        # Transform mock to dictionary tx_hash -> traces
+        tx_hash_with_traces = {}
+        for trace_transaction_result in trace_transactions_result:
+            tx_hash = trace_transaction_result[0]["transactionHash"]
+            tx_hash_with_traces[tx_hash] = trace_transaction_result
+            # Create transaction in db so not fetching of transaction is needed
+            EthereumTxFactory(tx_hash=tx_hash)
+
+        # After the first processing transactions will be cached to prevent reprocessing
+        processed_element_cache = (
+            self.internal_tx_indexer.element_already_processed_checker._processed_element_cache
+        )
+        self.assertEqual(len(processed_element_cache), 0)
+        self.assertEqual(
+            len(self.internal_tx_indexer.process_elements(tx_hash_with_traces)), 2
+        )
+        self.assertEqual(len(processed_element_cache), 2)
+
+        # Transactions are cached and will not be reprocessed
+        self.assertEqual(
+            len(self.internal_tx_indexer.process_elements(tx_hash_with_traces)), 0
+        )
+        self.assertEqual(
+            len(self.internal_tx_indexer.process_elements(tx_hash_with_traces)), 0
+        )
+
+        # Cleaning the cache will reprocess the transactions again
+        self.internal_tx_indexer.element_already_processed_checker.clear()
+        self.assertEqual(
+            len(self.internal_tx_indexer.process_elements(tx_hash_with_traces)), 2
+        )

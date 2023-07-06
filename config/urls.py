@@ -11,10 +11,9 @@ from rest_framework import permissions
 
 schema_view = get_schema_view(
     openapi.Info(
-        title="Gnosis Safe Transaction Service API",
+        title="Safe Transaction Service API",
         default_version="v1",
         description="API to keep track of transactions sent via Gnosis Safe smart contracts",
-        contact=openapi.Contact(email="safe@gnosis.io"),
         license=openapi.License(name="MIT License"),
     ),
     validators=["flex", "ssv"],
@@ -55,12 +54,28 @@ urlpatterns_v1 = [
         ),
     ),
     path(
+        "",
+        include(
+            "safe_transaction_service.safe_messages.urls", namespace="safe_messages"
+        ),
+    ),
+    path(
         "tokens/", include("safe_transaction_service.tokens.urls", namespace="tokens")
     ),
 ]
 urlpatterns_v2 = [
-    path("", include("safe_transaction_service.history.urls_v2", namespace="history"))
+    path("", include("safe_transaction_service.history.urls_v2", namespace="history")),
 ]
+
+if settings.ENABLE_ANALYTICS:
+    urlpatterns_v2 += [
+        path(
+            "analytics/",
+            include(
+                "safe_transaction_service.analytics.urls_v2", namespace="analytics"
+            ),
+        ),
+    ]
 
 urlpatterns = swagger_urlpatterns + [
     path(settings.ADMIN_URL, admin.site.urls),

@@ -1,5 +1,6 @@
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from logging import getLogger
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -37,14 +38,14 @@ class EthereumIndexer(ABC):
         block_process_limit_max: int = 0,
         blocks_to_reindex_again: int = 0,
         updated_blocks_behind: int = 20,
-        query_chunk_size: Optional[int] = 5000,
+        query_chunk_size: Optional[int] = 1_000,
         block_auto_process_limit: bool = True,
     ):
         """
         :param ethereum_client:
         :param confirmations: Don't index last `confirmations` blocks to prevent from reorgs
         :param block_process_limit: Number of blocks to scan at a time for relevant data. `0` == `No limit`
-        :param block_process_limit: Maximum bumber of blocks to scan at a time for relevant data. `0` == `No limit`
+        :param block_process_limit_max: Maximum bumber of blocks to scan at a time for relevant data. `0` == `No limit`
         :param blocks_to_reindex_again: Number of blocks to reindex every time the indexer runs, in case something
             was missed.
         :param updated_blocks_behind: Number of blocks scanned for an address that can be behind and
@@ -136,23 +137,29 @@ class EthereumIndexer(ABC):
             current_block_number or self.ethereum_client.current_block_number
         )
 
-        common_minimum_block_number = self.get_minimum_block_number(addresses)
-        if common_minimum_block_number is None:  # Empty queryset
+        from_block_number = self.get_minimum_block_number(addresses)
+        if from_block_number is None:  # Empty queryset
             return None
 
-        from_block_number = common_minimum_block_number + 1
-        if (from_block_number + self.block_process_limit) >= (
-            current_block_number - self.confirmations
-        ):
-            # Reindex again when it's almost synced to prevent reorg/missing elements issues
-            from_block_number = max(from_block_number - self.blocks_to_reindex_again, 0)
-
-        if (current_block_number - common_minimum_block_number) <= self.confirmations:
+        if (current_block_number - from_block_number) < self.confirmations:
             return  # We don't want problems with reorgs
 
         to_block_number = self.get_to_block_number(
             from_block_number, current_block_number
         )
+
+        # Reindex again when it's almost synced to prevent reorg/missing elements issues
+        if (
+            from_block_number + self.block_process_limit
+            > current_block_number - self.confirmations
+        ):
+            # Check if there's room on `block_process_limit` to reindex some blocks
+            blocks_to_reindex = min(
+                self.block_process_limit - (to_block_number - from_block_number + 1),
+                self.blocks_to_reindex_again,
+            )
+            from_block_number = max(from_block_number - blocks_to_reindex, 0)
+
         return from_block_number, to_block_number
 
     def get_to_block_number(
@@ -161,10 +168,11 @@ class EthereumIndexer(ABC):
         """
         :param from_block_number:
         :param current_block_number:
+
         :return: Top block number to process
         """
         return min(
-            from_block_number + self.block_process_limit,
+            from_block_number + self.block_process_limit - 1,
             current_block_number - self.confirmations,
         )
 
@@ -177,9 +185,9 @@ class EthereumIndexer(ABC):
             minimum block number for every `address` on the table.
         """
         logger.debug(
-            "%s: Getting minimum-block-number for %d addresses",
+            "%s: Getting minimum-block-number for %s addresses",
             self.__class__.__name__,
-            len(addresses) if addresses else 0,
+            len(addresses) if addresses else "all the",
         )
         queryset = (
             self.database_queryset.filter(address__in=addresses)
@@ -204,17 +212,27 @@ class EthereumIndexer(ABC):
         :param current_block_number:
         :return: Addresses almost updated (< `updated_blocks_behind` blocks) to be processed
         """
+
+        logger.debug(
+            "%s: Retrieving almost updated monitored addresses", self.__class__.__name__
+        )
+
         from_block_number = max(
             self.get_minimum_block_number() or 0,
             current_block_number - self.updated_blocks_behind,
         )
         to_block_number = current_block_number - self.confirmations
-        return self.database_queryset.filter(
+        almost_updated_addresses = self.database_queryset.filter(
             **{
                 self.database_field + "__lt": to_block_number,
                 self.database_field + "__gte": from_block_number,
             }
         ).order_by(self.database_field)
+
+        logger.debug(
+            "%s: Retrieved almost updated monitored addresses", self.__class__.__name__
+        )
+        return almost_updated_addresses
 
     def get_not_updated_addresses(
         self, current_block_number: int
@@ -223,53 +241,137 @@ class EthereumIndexer(ABC):
         :param current_block_number:
         :return: Addresses not updated (> `updated_blocks_behind` blocks) to be processed
         """
-        return self.database_queryset.filter(
-            **{self.database_field + "__lt": current_block_number - self.confirmations}
+        logger.debug(
+            "%s: Retrieving not updated monitored addresses",
+            self.__class__.__name__,
+        )
+
+        not_updated_addresses = self.database_queryset.filter(
+            **{self.database_field + "__lte": current_block_number - self.confirmations}
         ).order_by(self.database_field)
 
-    def update_monitored_address(
+        logger.debug(
+            "%s: Retrieved not updated monitored addresses",
+            self.__class__.__name__,
+        )
+        return not_updated_addresses
+
+    def update_monitored_addresses(
         self, addresses: Sequence[str], from_block_number: int, to_block_number: int
-    ) -> int:
+    ) -> bool:
         """
         :param addresses: Addresses to have the block number updated
         :param from_block_number: Make sure that no reorg has happened checking that block number was not rollbacked
         :param to_block_number: Block number to be updated
         :return: Number of addresses updated
         """
+
+        logger.debug(
+            "%s: Updating monitored addresses",
+            self.__class__.__name__,
+        )
+
+        # Keep indexing going on the next block
+        new_to_block_number = to_block_number + 1
+
         updated_addresses = self.database_queryset.filter(
             **{
                 "address__in": addresses,
                 self.database_field
-                + "__gte": from_block_number
-                - 1,  # Protect in case of reorg
+                + "__gte": from_block_number,  # Protect in case of reorg
                 self.database_field
-                + "__lte": to_block_number,  # Don't update to a lower block number
+                + "__lt": new_to_block_number,  # Don't update to a lower block number
             }
-        ).update(**{self.database_field: to_block_number})
+        ).update(**{self.database_field: new_to_block_number})
 
-        if updated_addresses != len(addresses):
+        all_updated = updated_addresses == len(addresses)
+        if not all_updated:
             logger.warning(
-                "%s: Possible reorg - Cannot update all indexed addresses=%s... Updated %d/%d addresses "
+                "%s: Possible reorg - Cannot update all indexed addresses... Updated %d/%d addresses "
                 "from-block-number=%d to-block-number=%d",
                 self.__class__.__name__,
-                addresses[:10],
                 updated_addresses,
                 len(addresses),
                 from_block_number,
-                to_block_number,
+                new_to_block_number,
             )
+
+        logger.debug(
+            "%s: Updated monitored addresses",
+            self.__class__.__name__,
+        )
 
         return updated_addresses
 
+    @contextmanager
+    def auto_adjust_block_limit(self, from_block_number: int, to_block_number: int):
+        """
+        Optimize number of elements processed every time (block process limit)
+        based on how fast the block interval is retrieved
+        """
+
+        # Check that we are processing the `block_process_limit`, if not, measures are not valid
+        if not (
+            self.block_auto_process_limit
+            and (1 + to_block_number - from_block_number) == self.block_process_limit
+        ):
+            # Auto adjustment disabled
+            yield
+        else:
+            start = int(time.time())
+            yield
+            delta = int(time.time()) - start
+            if delta > 30:
+                self.block_process_limit = max(self.block_process_limit // 2, 1)
+                logger.info(
+                    "%s: block_process_limit halved to %d",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                )
+            elif delta > 10:
+                new_block_process_limit = max(self.block_process_limit - 20, 1)
+                self.block_process_limit = new_block_process_limit
+                logger.info(
+                    "%s: block_process_limit decreased to %d",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                )
+            elif delta < 2:
+                self.block_process_limit *= 2
+                logger.info(
+                    "%s: block_process_limit duplicated to %d",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                )
+            elif delta < 5:
+                self.block_process_limit += 20
+                logger.info(
+                    "%s: block_process_limit increased to %d",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                )
+
+            if (
+                self.block_process_limit_max
+                and self.block_process_limit > self.block_process_limit_max
+            ):
+                logger.info(
+                    "%s: block_process_limit %d is bigger than block_process_limit_max %d, reducing",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                    self.block_process_limit_max,
+                )
+                self.block_process_limit = self.block_process_limit_max
+
     def process_addresses(
         self, addresses: Sequence[str], current_block_number: Optional[int] = None
-    ) -> Tuple[Sequence[Any], int, bool]:
+    ) -> Tuple[Sequence[Any], Optional[int], int, bool]:
         """
         Find and process relevant data for `addresses`, then store and return it
 
         :param addresses: Addresses to process
         :param current_block_number: To prevent fetching it again
-        :return: Tuple with a sequence of `processed data`, `last_block_number` processed
+        :return: Tuple with a sequence of `processed data`, `first_block_number` processed,`last_block_number` processed
             and `True` if no more blocks to scan, `False` otherwise
         """
         assert addresses, "Addresses cannot be empty!"
@@ -279,20 +381,10 @@ class EthereumIndexer(ABC):
         )
         parameters = self.get_block_numbers_for_search(addresses, current_block_number)
         if parameters is None:
-            return [], current_block_number, True
+            return [], None, current_block_number, True
         from_block_number, to_block_number = parameters
 
         updated = to_block_number == (current_block_number - self.confirmations)
-
-        # Optimize number of elements processed every time (block process limit)
-        # Check that we are processing the `block_process_limit`, if not, measures are not valid
-        if (
-            self.block_auto_process_limit
-            and (to_block_number - from_block_number) == self.block_process_limit
-        ):
-            start = int(time.time())
-        else:
-            start = None
 
         try:
             elements = self.find_relevant_elements(
@@ -310,60 +402,22 @@ class EthereumIndexer(ABC):
             )
             raise e
 
-        if start:
-            delta = int(time.time()) - start
-            if delta > 30:
-                self.block_process_limit //= 2
-                logger.info(
-                    "%s: block_process_limit halved to %d",
-                    self.__class__.__name__,
-                    self.block_process_limit,
-                )
-            elif delta > 10:
-                new_block_process_limit = max(self.block_process_limit - 20, 1)
-                self.block_process_limit = new_block_process_limit
-                logger.info(
-                    "%s: block_process_limit decreased to %d",
-                    self.__class__.__name__,
-                    self.block_process_limit,
-                )
-            elif delta < 1:
-                self.block_process_limit *= 2
-                logger.info(
-                    "%s: block_process_limit duplicated to %d",
-                    self.__class__.__name__,
-                    self.block_process_limit,
-                )
-            elif delta < 3:
-                self.block_process_limit += 20
-                logger.info(
-                    "%s: block_process_limit increased to %d",
-                    self.__class__.__name__,
-                    self.block_process_limit,
-                )
-
-        if (
-            self.block_process_limit_max
-            and self.block_process_limit > self.block_process_limit_max
-        ):
-            self.block_process_limit = self.block_process_limit_max
-            logger.info(
-                "%s: block_process_limit %d is bigger than block_process_limit_max %d, reducing",
-                self.__class__.__name__,
-                self.block_process_limit,
-                self.block_process_limit_max,
-            )
-
         processed_elements = self.process_elements(elements)
 
-        self.update_monitored_address(addresses, from_block_number, to_block_number)
-        return processed_elements, to_block_number, updated
+        if not self.update_monitored_addresses(
+            addresses, from_block_number, to_block_number
+        ):
+            raise ValueError(
+                "Possible reorg, indexed addresses were updated while indexer was running"
+            )
 
-    def start(self) -> int:
+        return processed_elements, from_block_number, to_block_number, updated
+
+    def start(self) -> Tuple[int, int]:
         """
         Find and process relevant data for existing database addresses
 
-        :return: Number of elements processed
+        :return: (number of elements processed, number of blocks processed)
         """
         current_block_number = self.ethereum_client.current_block_number
         logger.debug(
@@ -371,12 +425,9 @@ class EthereumIndexer(ABC):
             self.__class__.__name__,
             current_block_number,
         )
-        number_processed_elements = 0
-
-        logger.debug(
-            "%s: Retrieving almost updated monitored addresses", self.__class__.__name__
-        )
-
+        total_number_processed_elements = 0
+        start_block: Optional[int] = None
+        last_block: Optional[int] = None
         almost_updated_addresses = list(
             self.get_almost_updated_addresses(current_block_number)
         )
@@ -392,16 +443,27 @@ class EthereumIndexer(ABC):
                     monitored_contract.address
                     for monitored_contract in almost_updated_addresses
                 ]
-                processed_elements, _, updated = self.process_addresses(
+                (
+                    processed_elements,
+                    from_block_number,
+                    to_block_number,
+                    updated,
+                ) = self.process_addresses(
                     almost_updated_addresses_to_process,
                     current_block_number=current_block_number,
                 )
-                number_processed_elements += len(processed_elements)
-
-            logger.debug(
-                "%s: Retrieving not updated monitored addresses",
-                self.__class__.__name__,
-            )
+                number_processed_elements = len(processed_elements)
+                logger.debug(
+                    "%s: Processed %d elements for almost updated addresses. From-block-number=%s to-block-number=%d",
+                    self.__class__.__name__,
+                    number_processed_elements,
+                    from_block_number,  # Can be None
+                    to_block_number,
+                )
+                total_number_processed_elements += number_processed_elements
+                if start_block is None:
+                    start_block = from_block_number
+            last_block = to_block_number
         else:
             logger.debug(
                 "%s: No almost updated addresses to process", self.__class__.__name__
@@ -418,10 +480,7 @@ class EthereumIndexer(ABC):
             )
 
             # Not updated addresses are sorted by tx_block_number
-            minimum_block_number = getattr(
-                not_updated_addresses[0], self.database_field
-            )
-            from_block_number = minimum_block_number + 1
+            from_block_number = getattr(not_updated_addresses[0], self.database_field)
             updated = False
             while not updated:
                 # Estimate to_block_number
@@ -434,22 +493,40 @@ class EthereumIndexer(ABC):
                     monitored_contract.address
                     for monitored_contract in not_updated_addresses
                     if getattr(monitored_contract, self.database_field)
-                    < to_block_number_expected
+                    <= to_block_number_expected
                 ]
                 # Get real `to_block_number` processed
                 (
                     processed_elements,
+                    from_block_number,
                     to_block_number,
                     updated,
                 ) = self.process_addresses(
                     not_updated_addresses_to_process,
                     current_block_number=current_block_number,
                 )
-                number_processed_elements += len(processed_elements)
-                from_block_number = to_block_number + 1
+                if start_block is None or from_block_number < start_block:
+                    start_block = from_block_number
+
+                number_processed_elements = len(processed_elements)
+                logger.debug(
+                    "%s: Processed %d elements for not updated addresses. From-block-number=%s to-block-number=%d",
+                    self.__class__.__name__,
+                    number_processed_elements,
+                    from_block_number,  # Can be None
+                    to_block_number,
+                )
+                total_number_processed_elements += number_processed_elements
+                from_block_number += 1
+            if last_block is None or to_block_number > last_block:
+                last_block = to_block_number
         else:
             logger.debug(
                 "%s: No not updated addresses to process", self.__class__.__name__
             )
+        if start_block is not None and last_block is not None:
+            number_of_blocks_processed = last_block - start_block + 1
+        else:
+            number_of_blocks_processed = 0
 
-        return number_processed_elements
+        return total_number_processed_elements, number_of_blocks_processed
