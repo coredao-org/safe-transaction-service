@@ -32,5 +32,5 @@ psycogreen==1.0.2
 psycopg2==2.9.6
 redis==4.5.5
 requests==2.31.0
-safe-eth-py[django] @ git+https://github.com/coredao-org/safe-eth-py@3396f865d1165ed1223997aea7253f06c1e78732
+safe-eth-py[django] @ git+https://github.com/coredao-org/safe-eth-py@db6159a4c6a46362273d6733246ba0c40e028761
 web3==6.5.0
