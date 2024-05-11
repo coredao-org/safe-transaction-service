@@ -5,9 +5,9 @@ from django.test import TestCase
 
 from eth_account import Account
 from eth_utils import keccak
-from web3 import Web3
 
 from gnosis.eth.ethereum_client import TracingManager
+from gnosis.eth.utils import fast_keccak_text
 from gnosis.safe.safe_signature import SafeSignatureType
 from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
 
@@ -35,7 +35,7 @@ from .factories import (
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
 )
-from .mocks.traces import call_trace, module_traces, rinkeby_traces
+from .mocks.traces import call_trace, module_traces, testnet_traces
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             TracingManager,
             "trace_transaction",
             autospec=True,
-            return_value=rinkeby_traces,
+            return_value=testnet_traces,
         ):
             # call_trace has [] as a trace address and module txs need to get the grandfather tx, so [0,0] must
             # be used
@@ -326,7 +326,7 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
                 SafeSignatureType.APPROVED_HASH.value,
             )
 
-    def test_tx_processor_failed(self):
+    def test_tx_processor_is_failed(self):
         tx_processor = self.tx_processor
         # Event for Safes < 1.1.1
         logs = [
@@ -340,7 +340,7 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         ethereum_tx = EthereumTxFactory(logs=logs)
         self.assertTrue(tx_processor.is_failed(ethereum_tx, logs[0]["data"]))
         self.assertFalse(
-            tx_processor.is_failed(ethereum_tx, Web3.keccak(text="hola").hex())
+            tx_processor.is_failed(ethereum_tx, fast_keccak_text("hola").hex())
         )
 
         # Event for Safes >= 1.1.1
@@ -359,7 +359,26 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         ethereum_tx = EthereumTxFactory(logs=logs)
         self.assertTrue(tx_processor.is_failed(ethereum_tx, safe_tx_hash))
         self.assertFalse(
-            tx_processor.is_failed(ethereum_tx, Web3.keccak(text="hola").hex())
+            tx_processor.is_failed(ethereum_tx, fast_keccak_text("hola").hex())
+        )
+
+        # Event for Safes >= 1.4.1
+        safe_tx_hash = (
+            "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311"
+        )
+        logs = [
+            {
+                "data": "0000000000000000000000000000000000000000000000000000000000000000",
+                "topics": [
+                    "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23",
+                    "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311",
+                ],
+            }
+        ]
+        ethereum_tx = EthereumTxFactory(logs=logs)
+        self.assertTrue(tx_processor.is_failed(ethereum_tx, safe_tx_hash))
+        self.assertFalse(
+            tx_processor.is_failed(ethereum_tx, fast_keccak_text("hola").hex())
         )
 
     def test_tx_is_version_breaking_signatures(self):
