@@ -557,6 +557,7 @@ SWAGGER_SETTINGS = {
     "SECURITY_DEFINITIONS": {
         "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
     },
+    "DEFAULT_API_URL": env("SWAGGER_DOC_DOMAIN", default=None),
 }
 
 # Shell Plus
